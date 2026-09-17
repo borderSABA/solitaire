@@ -1058,6 +1058,44 @@ body {
   font-weight: 700;
 }
 
+.stats-cell-btn {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid #666;
+  border-radius: 6px;
+  background: #202020;
+  color: #fff;
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.stats-cell-btn:hover,
+.stats-cell-btn.selected {
+  background: #454545;
+  border-color: #aaa;
+}
+
+.stats-segment-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.stats-segment-count {
+  color: #fff;
+  font-size: 20px;
+  font-weight: 800;
+}
+
+.stats-segment-note {
+  color: #aaa;
+  font-size: 12px;
+  margin: -4px 0 10px;
+}
+
 .stats-player-list {
   display: flex;
   flex-direction: column;
@@ -1101,7 +1139,7 @@ body {
 </head>
 <body>
 <div id="felt-wrapper"><div id="game-scale-wrapper"><div id="app"></div></div></div>
-<div id="version-badge" class="version-badge" aria-label="version">v1.2.0</div>
+<div id="version-badge" class="version-badge" aria-label="version">v1.2.2</div>
 <script>
 (function(){
 "use strict";
@@ -2780,13 +2818,15 @@ let currentSeedSource = "random";
 let currentRunId = (0, playerStatsStore_1.makeRunEventId)();
 let currentRunPlayerName = (0, playerStatsStore_1.loadPlayerName)();
 const seedToolsVisible = new URLSearchParams(location.search).get("seedtools") === "1";
-const HOME_URL = "https://bordersaba.github.io/";
 let playerName = (0, playerStatsStore_1.loadPlayerName)();
 let menuTotalClearCount = null;
 let menuStatsLoadedFor = "";
 let statsSummary = null;
 let statsPlayers = [];
 let statsSelectedPlayerName = playerName;
+let statsSelectedMode = "freecell";
+let statsSelectedLevel = 1;
+let statsSegmentPlayers = [];
 let statsLoading = false;
 let statsStatusText = "";
 let playerStatsSyncInFlight = false;
@@ -4476,9 +4516,6 @@ function clearReplayLevelSelect() {
 // -------------------------------------------------
 // HOME / 戦績
 // -------------------------------------------------
-function goCommonHome() {
-    location.href = HOME_URL;
-}
 function ensureMenuStatsLoaded() {
     const name = (0, playerStatsStore_1.normalizePlayerName)(playerName || (0, playerStatsStore_1.loadPlayerName)());
     if (!name) {
@@ -4514,12 +4551,17 @@ async function refreshStatsScreen(targetName = statsSelectedPlayerName, showLoad
         rerender();
     }
     try {
-        const [players, summary] = await Promise.all([
-            (0, playerStatsApi_1.fetchPlayerList)(),
+        const [summary, segmentPlayers] = await Promise.all([
             target ? (0, playerStatsApi_1.fetchPlayerStats)(target) : Promise.resolve(null),
+            (0, playerStatsApi_1.fetchModeLevelStats)(statsSelectedMode, statsSelectedLevel),
         ]);
-        statsPlayers = players;
         statsSummary = summary;
+        statsSegmentPlayers = segmentPlayers;
+        statsPlayers = segmentPlayers.map(p => ({
+            playerName: p.playerName,
+            total: p.total,
+            lastClearTs: p.lastClearTs,
+        }));
         if (target && target === playerName && summary) {
             menuTotalClearCount = summary.total;
             menuStatsLoadedFor = target;
@@ -4535,11 +4577,38 @@ async function refreshStatsScreen(targetName = statsSelectedPlayerName, showLoad
             rerender();
     }
 }
+async function selectStatsModeLevel(mode, level) {
+    statsSelectedMode = mode;
+    statsSelectedLevel = level;
+    statsLoading = true;
+    statsStatusText = "";
+    rerender();
+    try {
+        statsSegmentPlayers = await (0, playerStatsApi_1.fetchModeLevelStats)(mode, level);
+        statsPlayers = statsSegmentPlayers.map(p => ({
+            playerName: p.playerName,
+            total: p.total,
+            lastClearTs: p.lastClearTs,
+        }));
+    }
+    catch (err) {
+        log(`[PLAYER-STATS ${ts()}] segment load failed`, err);
+        statsStatusText = "戦績サーバーへ接続できません";
+    }
+    finally {
+        statsLoading = false;
+        if (screen === "stats")
+            rerender();
+    }
+}
 function openStats() {
     playerName = (0, playerStatsStore_1.loadPlayerName)();
     statsSelectedPlayerName = playerName;
+    statsSelectedMode = "freecell";
+    statsSelectedLevel = 1;
     statsSummary = null;
     statsPlayers = [];
+    statsSegmentPlayers = [];
     statsStatusText = "";
     screen = "stats";
     rerender();
@@ -4773,6 +4842,8 @@ const dnd = (0, dndCore_1.createDnD)({
 // 画面描画
 // -------------------------------------------------
 function rerender() {
+    const versionBadge = document.getElementById("version-badge");
+    if (versionBadge) versionBadge.style.display = screen === "menu" ? "block" : "none";
     ensureScaleShell();
     const rootEl = document.getElementById("app");
     if (!rootEl)
@@ -4789,7 +4860,6 @@ function rerender() {
             totalClearCount: menuTotalClearCount,
             seedToolsVisible,
         }, {
-            onHome: () => goCommonHome(),
             onStats: () => openStats(),
             onSelectMode: (mode) => {
                 pendingMode = mode;
@@ -4831,13 +4901,16 @@ function rerender() {
             selectedPlayerName: statsSelectedPlayerName,
             summary: statsSummary,
             players: statsPlayers,
+            selectedMode: statsSelectedMode,
+            selectedLevel: statsSelectedLevel,
+            segmentPlayers: statsSegmentPlayers,
             loading: statsLoading,
             statusText: statsStatusText,
         }, {
             onBack: () => backFromStats(),
-            onHome: () => goCommonHome(),
             onSaveName: (name) => saveStatsPlayerName(name),
             onSelectPlayer: (name) => void refreshStatsScreen(name, true),
+            onSelectModeLevel: (mode, level) => void selectStatsModeLevel(mode, level),
             onRefresh: () => void refreshStatsScreen(statsSelectedPlayerName, true),
         });
         afterRenderScale();
@@ -5538,6 +5611,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.flushPendingPlayerStats = flushPendingPlayerStats;
 exports.fetchPlayerStats = fetchPlayerStats;
 exports.fetchPlayerList = fetchPlayerList;
+exports.fetchModeLevelStats = fetchModeLevelStats;
 const config_1 = require("../config");
 const playerStatsStore_1 = require("./playerStatsStore");
 const REQUEST_TIMEOUT_MS = 10000;
@@ -5621,6 +5695,19 @@ async function fetchPlayerList() {
     return players
         .map((p) => ({
         playerName: String(p?.playerName || ""),
+        total: Math.max(0, Number(p?.total || 0) | 0),
+        lastClearTs: p?.lastClearTs == null ? null : Number(p.lastClearTs),
+    }))
+        .filter((p) => p.playerName);
+}
+async function fetchModeLevelStats(mode, level) {
+    const q = new URLSearchParams({ mode, level: String(level) });
+    const body = await fetchJson(`/api/player-stats/segment?${q.toString()}`, { method: "GET" });
+    const players = Array.isArray(body?.players) ? body.players : [];
+    return players
+        .map((p) => ({
+        playerName: String(p?.playerName || ""),
+        count: Math.max(0, Number(p?.count || 0) | 0),
         total: Math.max(0, Number(p?.total || 0) | 0),
         lastClearTs: p?.lastClearTs == null ? null : Number(p.lastClearTs),
     }))
@@ -6953,11 +7040,6 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
     screen.className = "menu-screen";
     const nav = document.createElement("div");
     nav.className = "solitaire-top-nav";
-    const homeBtn = document.createElement("button");
-    homeBtn.className = "top-nav-btn";
-    homeBtn.textContent = "HOME";
-    homeBtn.addEventListener("click", handlers.onHome);
-    nav.appendChild(homeBtn);
     const statsBtn = document.createElement("button");
     statsBtn.className = "top-nav-btn";
     statsBtn.textContent = "戦績";
@@ -7334,11 +7416,6 @@ function renderStatsScreen(root, opts, handlers) {
     screen.className = "stats-screen";
     const nav = document.createElement("div");
     nav.className = "solitaire-top-nav";
-    const home = document.createElement("button");
-    home.className = "top-nav-btn";
-    home.textContent = "HOME";
-    home.addEventListener("click", handlers.onHome);
-    nav.appendChild(home);
     const back = document.createElement("button");
     back.className = "top-nav-btn";
     back.textContent = "← ソリティア";
@@ -7360,8 +7437,7 @@ function renderStatsScreen(root, opts, handlers) {
     input.value = opts.playerName;
     input.placeholder = "名前を入力";
     input.addEventListener("keydown", ev => {
-        if (ev.key === "Enter")
-            handlers.onSaveName(input.value);
+        if (ev.key === "Enter") handlers.onSaveName(input.value);
     });
     const save = document.createElement("button");
     save.className = "stats-action-btn";
@@ -7375,6 +7451,11 @@ function renderStatsScreen(root, opts, handlers) {
         status.textContent = opts.statusText;
         screen.appendChild(status);
     }
+    const labels = {
+        freecell: "フリーセル",
+        klondike: "クロンダイク",
+        spider: "スパイダー",
+    };
     const card = document.createElement("section");
     card.className = "stats-card";
     const cardTitle = document.createElement("div");
@@ -7383,7 +7464,7 @@ function renderStatsScreen(root, opts, handlers) {
         ? `${opts.selectedPlayerName} の戦績`
         : "名前を設定すると戦績を表示できます";
     card.appendChild(cardTitle);
-    if (opts.loading) {
+    if (opts.loading && !opts.summary) {
         const loading = document.createElement("div");
         loading.className = "stats-loading";
         loading.textContent = "読み込み中...";
@@ -7400,56 +7481,92 @@ function renderStatsScreen(root, opts, handlers) {
       <thead><tr><th>モード</th><th>Lv1</th><th>Lv2</th><th>Lv3</th><th>合計</th></tr></thead>
       <tbody></tbody>`;
         const tbody = table.querySelector("tbody");
-        const labels = {
-            freecell: "フリーセル",
-            klondike: "クロンダイク",
-            spider: "スパイダー",
-        };
         for (const mode of ["freecell", "klondike", "spider"]) {
             const arr = opts.summary.byModeLevel[mode];
             const tr = document.createElement("tr");
-            const sum = arr[0] + arr[1] + arr[2];
-            tr.innerHTML = `<td>${labels[mode]}</td><td>${arr[0]}</td><td>${arr[1]}</td><td>${arr[2]}</td><td>${sum}</td>`;
+            const modeTd = document.createElement("td");
+            modeTd.textContent = labels[mode];
+            tr.appendChild(modeTd);
+            for (let level = 1; level <= 3; level++) {
+                const td = document.createElement("td");
+                const b = document.createElement("button");
+                b.className = `stats-cell-btn${opts.selectedMode === mode && opts.selectedLevel === level ? " selected" : ""}`;
+                b.textContent = String(arr[level - 1]);
+                b.title = `${labels[mode]} Lv${level} の詳細を見る`;
+                b.addEventListener("click", () => handlers.onSelectModeLevel(mode, level));
+                td.appendChild(b);
+                tr.appendChild(td);
+            }
+            const sumTd = document.createElement("td");
+            sumTd.textContent = String(arr[0] + arr[1] + arr[2]);
+            tr.appendChild(sumTd);
             tbody.appendChild(tr);
         }
         card.appendChild(table);
     }
     screen.appendChild(card);
-    const others = document.createElement("section");
-    others.className = "stats-card stats-players-card";
-    const othersHead = document.createElement("div");
-    othersHead.className = "stats-card-title stats-card-title-row";
-    const txt = document.createElement("span");
-    txt.textContent = "他のプレイヤー";
+
+    const detail = document.createElement("section");
+    detail.className = "stats-card stats-players-card";
+    const detailHead = document.createElement("div");
+    detailHead.className = "stats-card-title stats-card-title-row";
+    const detailTitle = document.createElement("span");
+    detailTitle.textContent = `${labels[opts.selectedMode]} Lv${opts.selectedLevel}`;
     const refresh = document.createElement("button");
     refresh.className = "stats-small-btn";
     refresh.textContent = "更新";
     refresh.addEventListener("click", handlers.onRefresh);
-    othersHead.append(txt, refresh);
-    others.appendChild(othersHead);
+    detailHead.append(detailTitle, refresh);
+    detail.appendChild(detailHead);
+
+    if (opts.summary) {
+        const ownArr = opts.summary.byModeLevel[opts.selectedMode] || [0, 0, 0];
+        const currentCount = ownArr[opts.selectedLevel - 1] || 0;
+        const segmentHead = document.createElement("div");
+        segmentHead.className = "stats-segment-head";
+        const who = document.createElement("span");
+        who.textContent = opts.selectedPlayerName || "―";
+        const cnt = document.createElement("span");
+        cnt.className = "stats-segment-count";
+        cnt.textContent = `${currentCount}回クリア`;
+        segmentHead.append(who, cnt);
+        detail.appendChild(segmentHead);
+    }
+
+    const note = document.createElement("div");
+    note.className = "stats-segment-note";
+    note.textContent = "下には、このモード・このレベルでの各プレイヤーのクリア数を表示します。";
+    detail.appendChild(note);
+
     const list = document.createElement("div");
     list.className = "stats-player-list";
-    if (!opts.players.length) {
+    if (opts.loading && !opts.segmentPlayers.length) {
+        const loading = document.createElement("div");
+        loading.className = "stats-loading";
+        loading.textContent = "読み込み中...";
+        list.appendChild(loading);
+    }
+    else if (!opts.segmentPlayers.length) {
         const empty = document.createElement("div");
         empty.className = "stats-empty";
         empty.textContent = "まだ表示できるプレイヤー戦績がありません";
         list.appendChild(empty);
     }
     else {
-        for (const p of opts.players) {
+        for (const p of opts.segmentPlayers) {
             const btn = document.createElement("button");
             btn.className = `stats-player-row${p.playerName === opts.selectedPlayerName ? " selected" : ""}`;
             const name = document.createElement("span");
             name.textContent = p.playerName === opts.playerName ? `${p.playerName}（自分）` : p.playerName;
             const count = document.createElement("span");
-            count.textContent = `${p.total} クリア`;
+            count.textContent = `${p.count}回`;
             btn.append(name, count);
             btn.addEventListener("click", () => handlers.onSelectPlayer(p.playerName));
             list.appendChild(btn);
         }
     }
-    others.appendChild(list);
-    screen.appendChild(others);
+    detail.appendChild(list);
+    screen.appendChild(detail);
     root.appendChild(screen);
 }
 
