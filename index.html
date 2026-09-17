@@ -1162,14 +1162,22 @@ body {
   z-index: 5000 !important;
 }
 .support-hint-dest {
-  box-shadow: inset 0 0 0 4px #55b7ff, 0 0 18px rgba(85,183,255,.9) !important;
+  outline: 4px solid #55b7ff !important;
+  outline-offset: 2px;
+  box-shadow: inset 0 0 0 4px #55b7ff, 0 0 22px rgba(85,183,255,.95) !important;
+}
+.card.support-hint-dest-card {
+  outline: 4px solid #55b7ff !important;
+  outline-offset: 2px;
+  box-shadow: 0 0 22px rgba(85,183,255,.95) !important;
+  z-index: 4999 !important;
 }
 
 </style>
 </head>
 <body>
 <div id="felt-wrapper"><div id="game-scale-wrapper"><div id="app"></div></div></div>
-<div id="version-badge" class="version-badge" aria-label="version">v1.3.0</div>
+<div id="version-badge" class="version-badge" aria-label="version">v1.3.1</div>
 <script>
 (function(){
 "use strict";
@@ -4699,6 +4707,8 @@ function prepareSupportRoute(sess, moves) {
     keys.forEach((k, i) => supportRouteKeyToIndex.set(k, i));
     supportRouteIndex = 0;
     supportOffRoute = false;
+    // サポートON中はヒントを常時表示する。1手ごとに押し直す必要はない。
+    supportHintVisible = true;
     return true;
 }
 function syncSupportPosition() {
@@ -4708,9 +4718,10 @@ function syncSupportPosition() {
     if (idx === undefined) {
         supportOffRoute = true;
     } else {
-        if (idx !== supportRouteIndex) supportHintVisible = false;
         supportRouteIndex = idx;
         supportOffRoute = false;
+        // サポートONの間は、正解手を進めるたび次の一手を自動で表示し続ける。
+        supportHintVisible = true;
     }
 }
 function supportMoveLabel(move) {
@@ -4723,16 +4734,35 @@ function supportMoveLabel(move) {
     return `${cardText}: ${place(move.from)} → ${place(move.to)}`;
 }
 function applySupportHintDom() {
-    document.querySelectorAll(".support-hint-source,.support-hint-dest").forEach(el => el.classList.remove("support-hint-source", "support-hint-dest"));
-    if (!supportHintVisible || !supportRoute || supportOffRoute || supportRouteIndex >= supportRoute.length) return;
+    document.querySelectorAll(".support-hint-source,.support-hint-dest,.support-hint-dest-card").forEach(el => el.classList.remove("support-hint-source", "support-hint-dest", "support-hint-dest-card"));
+    if (!supportHintVisible || !supportRoute || supportOffRoute || supportRouteIndex >= supportRoute.length || !session || session.mode !== "freecell") return;
     const move = supportRoute[supportRouteIndex];
     for (const id of move.cards || []) {
         const el = document.querySelector(`[data-card-id="${CSS.escape(id)}"]`);
         if (el) el.classList.add("support-hint-source");
     }
+
+    // ドロップ枠そのものを青く強調。
     const destName = move.to.type === "column" ? `column-${move.to.index}` : move.to.type === "freecell" ? `freecell-${move.to.index}` : `foundation-${move.to.index}`;
     const dest = document.querySelector(`[data-drop="${destName}"]`);
     if (dest) dest.classList.add("support-hint-dest");
+
+    // 枠の上にカードが載っている場合、枠の光がカードに隠れるので
+    // 移動先の一番上のカードも直接青く強調する。
+    let destCard = null;
+    if (move.to.type === "column") {
+        const col = session.state.columns?.[move.to.index] || [];
+        destCard = col.length ? col[col.length - 1] : null;
+    } else if (move.to.type === "foundation") {
+        const pile = session.state.foundations?.[move.to.index] || [];
+        destCard = pile.length ? pile[pile.length - 1] : null;
+    } else if (move.to.type === "freecell") {
+        destCard = session.state.freecells?.[move.to.index] || null;
+    }
+    if (destCard?.id) {
+        const cardEl = document.querySelector(`[data-card-id="${CSS.escape(destCard.id)}"]`);
+        if (cardEl) cardEl.classList.add("support-hint-dest-card");
+    }
 }
 function restoreSupportRoute() {
     if (!session || session.mode !== "freecell" || !supportRoute) return;
@@ -6523,7 +6553,7 @@ function buildTopBar(session, opts, handlers) {
         right.appendChild(progress);
         const hint = document.createElement("button");
         hint.className = `support-hint-btn ${opts.supportOffRoute ? "offroute" : ""}`;
-        hint.textContent = opts.supportOffRoute ? "ルート復帰" : "ヒント";
+        hint.textContent = opts.supportOffRoute ? "ルート復帰" : "サポート ON";
         hint.addEventListener("click", handlers.onSupportHintClick);
         right.appendChild(hint);
     }
