@@ -1135,11 +1135,41 @@ body {
   }
 }
 
+
+/* ===== FreeCell クリアサポート ===== */
+.support-toggle {
+  min-width: 190px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1px solid #666;
+  font-size: 15px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.support-toggle.on { background:#173f2b; color:#8dffba; border-color:#39d97c; }
+.support-toggle.off { background:#262626; color:#bbb; }
+.support-desc { margin-top:6px; color:#aaa; font-size:12px; line-height:1.45; text-align:center; }
+.support-progress { color:#8dffba; font-size:12px; font-weight:700; white-space:nowrap; }
+.support-hint-btn {
+  background:#173f2b; border:1px solid #39d97c; color:#8dffba;
+  border-radius:6px; padding:6px 10px; font-weight:800; cursor:pointer;
+}
+.support-hint-btn.offroute { background:#4a2d16; border-color:#ffb14d; color:#ffd08a; }
+.card.support-hint-source {
+  outline: 4px solid #ffd43b !important;
+  outline-offset: -2px;
+  box-shadow: 0 0 18px rgba(255,212,59,.9) !important;
+  z-index: 5000 !important;
+}
+.support-hint-dest {
+  box-shadow: inset 0 0 0 4px #55b7ff, 0 0 18px rgba(85,183,255,.9) !important;
+}
+
 </style>
 </head>
 <body>
 <div id="felt-wrapper"><div id="game-scale-wrapper"><div id="app"></div></div></div>
-<div id="version-badge" class="version-badge" aria-label="version">v1.2.2</div>
+<div id="version-badge" class="version-badge" aria-label="version">v1.3.0</div>
 <script>
 (function(){
 "use strict";
@@ -2759,6 +2789,253 @@ exports.GameSession = GameSession;
 Object.defineProperty(exports, "__esModule", { value: true });
 
 },
+
+"core/freecell/solver.js": function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.solveFreeCellState = solveFreeCellState;
+/**
+ * FreeCell専用の探索器。UIを固めないようWeb Worker内で探索する。
+ * 現段階では「最短証明」ではなく、クリア可能であることを実手順で検証したルートを返す。
+ */
+function solverWorkerMain() {
+  const SUITS = ["H", "D", "C", "S"];
+  const SUIT_INDEX = { H: 0, D: 1, C: 2, S: 3 };
+  const color = (c) => (((c / 13) | 0) < 2 ? 0 : 1);
+  const rank = (c) => (c % 13) + 1;
+  const suit = (c) => (c / 13) | 0;
+  const cardCode = (c) => SUIT_INDEX[c.suit] * 13 + (c.rank - 1);
+  const cardId = (c) => `${SUITS[suit(c)]}${rank(c)}#0`;
+  const homeCount = (st) => st.f[0] + st.f[1] + st.f[2] + st.f[3];
+  const clone = (st) => ({ cols: st.cols.map((c) => c.slice()), fc: st.fc.slice(), f: st.f.slice() });
+  function safeToHome(c, f) {
+    const r = rank(c);
+    if (r <= 2) return true;
+    if (color(c) === 0) return r <= Math.min(f[2], f[3]) + 1;
+    return r <= Math.min(f[0], f[1]) + 1;
+  }
+  function normalize(st, path) {
+    st = clone(st); path = path.slice();
+    while (true) {
+      let moved = false;
+      for (let i = 0; i < st.fc.length; i++) {
+        const c = st.fc[i];
+        if (c >= 0 && rank(c) === st.f[suit(c)] + 1 && safeToHome(c, st.f)) {
+          st.fc[i] = -1; st.f[suit(c)]++;
+          path.push({ from: { type: "freecell", index: i }, to: { type: "foundation", index: suit(c) }, cards: [cardId(c)] });
+          moved = true; break;
+        }
+      }
+      if (moved) continue;
+      for (let i = 0; i < 8; i++) {
+        const col = st.cols[i]; if (!col.length) continue;
+        const c = col[col.length - 1];
+        if (rank(c) === st.f[suit(c)] + 1 && safeToHome(c, st.f)) {
+          const startIndex = col.length - 1;
+          col.pop(); st.f[suit(c)]++;
+          path.push({ from: { type: "column", index: i, startIndex }, to: { type: "foundation", index: suit(c) }, cards: [cardId(c)] });
+          moved = true; break;
+        }
+      }
+      if (!moved) break;
+    }
+    return [st, path];
+  }
+  function maxMovable(st) {
+    let ef = 0, ec = 0;
+    for (const x of st.fc) if (x < 0) ef++;
+    for (const c of st.cols) if (!c.length) ec++;
+    return (ef + 1) * (2 ** ec);
+  }
+  function tailStarts(col) {
+    if (!col.length) return [];
+    const out = [col.length - 1];
+    for (let i = col.length - 2; i >= 0; i--) {
+      if (color(col[i]) !== color(col[i + 1]) && rank(col[i]) === rank(col[i + 1]) + 1) out.push(i);
+      else break;
+    }
+    return out;
+  }
+  function stateKey(st) {
+    return st.cols.map((c) => c.join(".")).join("|") + ";" + st.fc.slice().sort((a,b)=>a-b).join(".") + ";" + st.f.join(".");
+  }
+  function stateScore(st, g) {
+    const home = homeCount(st);
+    let ec = 0, ef = 0, ordered = 0, exposed = 0;
+    for (const col of st.cols) {
+      if (!col.length) { ec++; continue; }
+      let k = 1;
+      for (let i = col.length - 2; i >= 0; i--) {
+        if (color(col[i]) !== color(col[i + 1]) && rank(col[i]) === rank(col[i + 1]) + 1) k++;
+        else break;
+      }
+      ordered += k;
+      const c = col[col.length - 1];
+      if (rank(c) === st.f[suit(c)] + 1) exposed++;
+    }
+    for (const c of st.fc) {
+      if (c < 0) ef++;
+      else if (rank(c) === st.f[suit(c)] + 1) exposed++;
+    }
+    return home * 120 + ec * 35 + ef * 12 + ordered * 2 + exposed * 8 - g * 0.8;
+  }
+  function* generateMoves(st) {
+    const mm = maxMovable(st);
+    const emptyCols = [];
+    for (let i = 0; i < 8; i++) if (!st.cols[i].length) emptyCols.push(i);
+    const firstEmpty = emptyCols.length ? emptyCols[0] : -1;
+    let emptyFc = -1;
+    for (let i = 0; i < st.fc.length; i++) if (st.fc[i] < 0) { emptyFc = i; break; }
+
+    // foundationへ送れる手は高優先度。normalizeでは安全手だけ自動化し、危険手も探索候補には残す。
+    for (let i = 0; i < 8; i++) {
+      const col = st.cols[i]; if (!col.length) continue;
+      const c = col[col.length - 1];
+      if (rank(c) === st.f[suit(c)] + 1) {
+        const ns = clone(st); ns.cols[i].pop(); ns.f[suit(c)]++;
+        yield [ns, { from: { type: "column", index: i, startIndex: col.length - 1 }, to: { type: "foundation", index: suit(c) }, cards: [cardId(c)] }];
+      }
+    }
+    for (let i = 0; i < st.fc.length; i++) {
+      const c = st.fc[i];
+      if (c >= 0 && rank(c) === st.f[suit(c)] + 1) {
+        const ns = clone(st); ns.fc[i] = -1; ns.f[suit(c)]++;
+        yield [ns, { from: { type: "freecell", index: i }, to: { type: "foundation", index: suit(c) }, cards: [cardId(c)] }];
+      }
+    }
+
+    // column -> column（連結した末尾スタックを原子手として扱う）
+    for (let i = 0; i < 8; i++) {
+      const col = st.cols[i]; if (!col.length) continue;
+      for (const si of tailStarts(col)) {
+        const seq = col.slice(si); if (seq.length > mm) continue;
+        const head = seq[0];
+        for (let j = 0; j < 8; j++) {
+          if (i === j) continue;
+          const dst = st.cols[j];
+          if (!dst.length) {
+            if (j !== firstEmpty || si === 0) continue; // 空列の対称移動を削減
+          } else {
+            const top = dst[dst.length - 1];
+            if (!(color(top) !== color(head) && rank(head) === rank(top) - 1)) continue;
+          }
+          const ns = clone(st); ns.cols[i].splice(si); ns.cols[j].push(...seq);
+          yield [ns, { from: { type: "column", index: i, startIndex: si }, to: { type: "column", index: j }, cards: seq.map(cardId) }];
+        }
+      }
+    }
+
+    // column -> freecell（空きセルは同値なので代表1枠だけ探索）
+    if (emptyFc >= 0) {
+      for (let i = 0; i < 8; i++) {
+        const col = st.cols[i]; if (!col.length) continue;
+        const c = col[col.length - 1];
+        const ns = clone(st); ns.cols[i].pop(); ns.fc[emptyFc] = c;
+        yield [ns, { from: { type: "column", index: i, startIndex: col.length - 1 }, to: { type: "freecell", index: emptyFc }, cards: [cardId(c)] }];
+      }
+    }
+
+    // freecell -> column
+    for (let fi = 0; fi < st.fc.length; fi++) {
+      const c = st.fc[fi]; if (c < 0) continue;
+      for (let j = 0; j < 8; j++) {
+        const dst = st.cols[j];
+        if (!dst.length) {
+          if (j !== firstEmpty) continue;
+        } else {
+          const top = dst[dst.length - 1];
+          if (!(color(top) !== color(c) && rank(c) === rank(top) - 1)) continue;
+        }
+        const ns = clone(st); ns.fc[fi] = -1; ns.cols[j].push(c);
+        yield [ns, { from: { type: "freecell", index: fi }, to: { type: "column", index: j }, cards: [cardId(c)] }];
+      }
+    }
+  }
+  class MaxHeap {
+    constructor() { this.a = []; }
+    get length() { return this.a.length; }
+    push(x) {
+      const a = this.a; let i = a.length; a.push(x);
+      while (i) { const p = (i - 1) >> 1; if (a[p][0] >= x[0]) break; a[i] = a[p]; i = p; }
+      a[i] = x;
+    }
+    pop() {
+      const a = this.a; if (!a.length) return null;
+      const root = a[0], last = a.pop();
+      if (a.length) {
+        let i = 0; a[0] = last;
+        while (true) {
+          const l = i * 2 + 1, r = l + 1; let b = i;
+          if (l < a.length && a[l][0] > a[b][0]) b = l;
+          if (r < a.length && a[r][0] > a[b][0]) b = r;
+          if (b === i) break;
+          [a[i], a[b]] = [a[b], a[i]]; i = b;
+        }
+      }
+      return root;
+    }
+  }
+  function solve(input, options) {
+    const maxMs = Math.max(500, Number(options?.maxMs || 4500));
+    const maxNodes = Math.max(10000, Number(options?.maxNodes || 500000));
+    const init = {
+      cols: input.columns.map((col) => col.map(cardCode)),
+      fc: input.freecells.map((c) => c ? cardCode(c) : -1),
+      f: input.foundations.map((p) => p.length),
+    };
+    let path = [];
+    let pair = normalize(init, path), st = pair[0]; path = pair[1];
+    if (homeCount(st) === 52) return { ok: true, moves: path, nodes: 0, elapsedMs: 0, optimal: false };
+    const heap = new MaxHeap();
+    const seen = new Map();
+    heap.push([stateScore(st, 0), 0, st, path]);
+    seen.set(stateKey(st), 0);
+    let nodes = 0;
+    const started = Date.now();
+    while (heap.length && nodes < maxNodes && Date.now() - started < maxMs) {
+      const item = heap.pop();
+      const g = item[1], cur = item[2], curPath = item[3];
+      for (const [raw, move] of generateMoves(cur)) {
+        let nextPath = curPath.concat([move]);
+        const normalized = normalize(raw, nextPath);
+        const ns = normalized[0]; nextPath = normalized[1];
+        const ng = g + 1;
+        if (homeCount(ns) === 52) {
+          return { ok: true, moves: nextPath, nodes, elapsedMs: Date.now() - started, optimal: false };
+        }
+        const k = stateKey(ns), prev = seen.get(k);
+        if (prev !== undefined && prev <= ng) continue;
+        seen.set(k, ng); nodes++;
+        heap.push([stateScore(ns, ng), ng, ns, nextPath]);
+      }
+    }
+    return { ok: false, moves: [], nodes, elapsedMs: Date.now() - started, optimal: false };
+  }
+  self.onmessage = (ev) => {
+    try { self.postMessage({ id: ev.data.id, result: solve(ev.data.state, ev.data.options || {}) }); }
+    catch (err) { self.postMessage({ id: ev.data.id, error: String(err?.stack || err) }); }
+  };
+}
+let solverSeq = 0;
+function solveFreeCellState(state, options = {}) {
+  return new Promise((resolve, reject) => {
+    const source = `(${solverWorkerMain.toString()})();`;
+    const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    const worker = new Worker(url);
+    const id = ++solverSeq;
+    const cleanup = () => { worker.terminate(); URL.revokeObjectURL(url); };
+    worker.onmessage = (ev) => {
+      if (ev.data?.id !== id) return;
+      cleanup();
+      if (ev.data?.error) reject(new Error(ev.data.error));
+      else resolve(ev.data.result);
+    };
+    worker.onerror = (ev) => { cleanup(); reject(new Error(ev.message || "FreeCell solver worker error")); };
+    worker.postMessage({ id, state: JSON.parse(JSON.stringify(state)), options });
+  });
+}
+
+},
 "src/config.js": function(module, exports, require) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -2781,6 +3058,7 @@ const session_1 = require("../shared/session");
 // ===== FreeCell側 =====
 const applyMove_1 = require("../core/freecell/applyMove");
 const rules_1 = require("../core/freecell/rules");
+const freecellSolver_1 = require("../core/freecell/solver");
 const renderGameScreen_1 = require("./ui/renderGameScreen");
 // ===== Klondike側 =====
 const rules_2 = require("../core/klondike/rules");
@@ -2811,6 +3089,17 @@ let screen = "menu";
 let pendingMode = undefined;
 let session = null;
 let clearGuaranteeEnabled = (0, clearGuaranteeSetting_1.loadClearGuaranteeEnabled)();
+const FREECELL_SUPPORT_KEY = "SolitaireFreeCellSupportV1";
+const FREECELL_SOLUTION_CACHE_KEY = "SolitaireFreeCellSolutionCacheV1";
+function loadFreeCellSupportEnabled() { try { return localStorage.getItem(FREECELL_SUPPORT_KEY) === "1"; } catch { return false; } }
+function saveFreeCellSupportEnabled(v) { try { localStorage.setItem(FREECELL_SUPPORT_KEY, v ? "1" : "0"); } catch {} }
+let freecellSupportEnabled = loadFreeCellSupportEnabled();
+let supportRoute = null;
+let supportRouteStateKeys = [];
+let supportRouteKeyToIndex = new Map();
+let supportRouteIndex = 0;
+let supportOffRoute = false;
+let supportHintVisible = false;
 let menuNetworkStatus = "";
 let startBusy = false;
 let seedSyncInFlight = false;
@@ -3710,6 +3999,10 @@ function savePlayerClearLocal(sess) {
     }
 }
 function recordClearOutcome(sess) {
+    if (sess?.mode === "freecell") {
+        const route = movesFromFreeCellSession(sess);
+        if (route.length) saveSolutionCache(sess.level | 0, sess.seed >>> 0, sess.dealVersion | 0, route);
+    }
     saveClearSeedLocal(sess);
     savePlayerClearLocal(sess);
 }
@@ -4343,6 +4636,7 @@ function undoOneMove() {
     if (ok) {
         uiState.selectedFrom = undefined;
         uiState.cleared = false;
+        supportHintVisible = false;
         uiState.statusText = "1手戻した";
         log(`[UNDO ${ts()}] ok=true`);
         rerender();
@@ -4360,7 +4654,207 @@ function openNewGameMenu() {
     uiState.showNewGameMenu = true;
     rerender();
 }
+
+function freecellStateKey(state) {
+    return state.columns.map(col => col.map(c => c.id).join(".")).join("|") + ";" +
+        state.freecells.map(c => c ? c.id : "-").join(".") + ";" +
+        state.foundations.map(p => p.length).join(".");
+}
+function clearSupportRuntime() {
+    supportRoute = null;
+    supportRouteStateKeys = [];
+    supportRouteKeyToIndex = new Map();
+    supportRouteIndex = 0;
+    supportOffRoute = false;
+    supportHintVisible = false;
+}
+function normalizeSupportMove(move) {
+    if (!move || !move.from || !move.to) return null;
+    const from = { type: move.from.type, index: Number(move.from.index), startIndex: move.from.startIndex == null ? undefined : Number(move.from.startIndex) };
+    const to = { type: move.to.type, index: Number(move.to.index) };
+    if (!["column","freecell","foundation"].includes(from.type) || !["column","freecell","foundation"].includes(to.type)) return null;
+    if (!Number.isInteger(from.index) || !Number.isInteger(to.index)) return null;
+    return { from, to, cards: Array.isArray(move.cards) ? move.cards.map(String) : [] };
+}
+function prepareSupportRoute(sess, moves) {
+    clearSupportRuntime();
+    if (!sess || sess.mode !== "freecell" || !Array.isArray(moves) || !moves.length) return false;
+    let state = JSON.parse(JSON.stringify(sess.state));
+    const keys = [freecellStateKey(state)];
+    const normalizedMoves = [];
+    for (let i = 0; i < moves.length; i++) {
+        const m = normalizeSupportMove(moves[i]);
+        if (!m) return false;
+        const result = (0, applyMove_1.applyMoveBundle)(state, m.from, m.to, i);
+        if (!result.ok) return false;
+        state = result.newState;
+        normalizedMoves.push({ ...m, cards: result.logEntry?.cards || m.cards });
+        keys.push(freecellStateKey(state));
+    }
+    const totalHome = state.foundations.reduce((n, p) => n + p.length, 0);
+    if (totalHome !== 52) return false;
+    supportRoute = normalizedMoves;
+    supportRouteStateKeys = keys;
+    supportRouteKeyToIndex = new Map();
+    keys.forEach((k, i) => supportRouteKeyToIndex.set(k, i));
+    supportRouteIndex = 0;
+    supportOffRoute = false;
+    return true;
+}
+function syncSupportPosition() {
+    if (!session || session.mode !== "freecell" || !supportRoute) return;
+    const key = freecellStateKey(session.state);
+    const idx = supportRouteKeyToIndex.get(key);
+    if (idx === undefined) {
+        supportOffRoute = true;
+    } else {
+        if (idx !== supportRouteIndex) supportHintVisible = false;
+        supportRouteIndex = idx;
+        supportOffRoute = false;
+    }
+}
+function supportMoveLabel(move) {
+    if (!move) return "";
+    const cardId = move.cards?.[0] || "カード";
+    const m = String(cardId).match(/^([HDCS])(\d+)#/);
+    let cardText = cardId;
+    if (m) cardText = `${suitGlyph(m[1])}${rankToLabel(Number(m[2]))}`;
+    const place = (p) => p.type === "column" ? `${p.index + 1}列目` : p.type === "freecell" ? `FREE ${p.index + 1}` : "HOME";
+    return `${cardText}: ${place(move.from)} → ${place(move.to)}`;
+}
+function applySupportHintDom() {
+    document.querySelectorAll(".support-hint-source,.support-hint-dest").forEach(el => el.classList.remove("support-hint-source", "support-hint-dest"));
+    if (!supportHintVisible || !supportRoute || supportOffRoute || supportRouteIndex >= supportRoute.length) return;
+    const move = supportRoute[supportRouteIndex];
+    for (const id of move.cards || []) {
+        const el = document.querySelector(`[data-card-id="${CSS.escape(id)}"]`);
+        if (el) el.classList.add("support-hint-source");
+    }
+    const destName = move.to.type === "column" ? `column-${move.to.index}` : move.to.type === "freecell" ? `freecell-${move.to.index}` : `foundation-${move.to.index}`;
+    const dest = document.querySelector(`[data-drop="${destName}"]`);
+    if (dest) dest.classList.add("support-hint-dest");
+}
+function restoreSupportRoute() {
+    if (!session || session.mode !== "freecell" || !supportRoute) return;
+    let restored = false;
+    while (session.undoStack?.length) {
+        if (supportRouteKeyToIndex.has(freecellStateKey(session.state))) { restored = true; break; }
+        if (!session.undo()) break;
+    }
+    if (supportRouteKeyToIndex.has(freecellStateKey(session.state))) restored = true;
+    if (restored) {
+        syncSupportPosition();
+        uiState.selectedFrom = undefined;
+        supportHintVisible = false;
+        uiState.statusText = `ルートへ復帰しました（${supportRouteIndex}/${supportRoute.length}手）`;
+    } else {
+        uiState.statusText = "保存ルートへ戻せませんでした";
+    }
+    rerender();
+}
+function onSupportHintClick() {
+    if (!supportRoute) { uiState.statusText = "サポートルートがありません"; rerender(); return; }
+    syncSupportPosition();
+    if (supportOffRoute) { restoreSupportRoute(); return; }
+    if (supportRouteIndex >= supportRoute.length) { uiState.statusText = "サポートルート完了です"; rerender(); return; }
+    supportHintVisible = true;
+    uiState.statusText = `次の手 ${supportRouteIndex + 1}/${supportRoute.length}: ${supportMoveLabel(supportRoute[supportRouteIndex])}`;
+    rerender();
+}
+function loadSolutionCache(level, seed, dealVersion) {
+    try {
+        const all = JSON.parse(localStorage.getItem(FREECELL_SOLUTION_CACHE_KEY) || "[]");
+        const found = Array.isArray(all) ? all.find(x => x && x.level === level && (x.seed >>> 0) === (seed >>> 0) && x.dealVersion === dealVersion) : null;
+        return found && Array.isArray(found.moves) ? found.moves : null;
+    } catch { return null; }
+}
+function saveSolutionCache(level, seed, dealVersion, moves) {
+    try {
+        if (!Array.isArray(moves) || !moves.length) return;
+        let all = JSON.parse(localStorage.getItem(FREECELL_SOLUTION_CACHE_KEY) || "[]");
+        if (!Array.isArray(all)) all = [];
+        const old = all.find(x => x && x.level === level && (x.seed >>> 0) === (seed >>> 0) && x.dealVersion === dealVersion);
+        // 同じseedでは「端末で確認できた最短のルート」を残す。
+        if (old && Array.isArray(old.moves) && old.moves.length <= moves.length) return;
+        all = all.filter(x => !(x && x.level === level && (x.seed >>> 0) === (seed >>> 0) && x.dealVersion === dealVersion));
+        all.unshift({ level, seed: seed >>> 0, dealVersion, moves, savedAt: Date.now() });
+        if (all.length > 24) all.length = 24;
+        localStorage.setItem(FREECELL_SOLUTION_CACHE_KEY, JSON.stringify(all));
+    } catch {}
+}
+function movesFromFreeCellSession(sess) {
+    if (!sess || sess.mode !== "freecell" || !Array.isArray(sess.moveLog)) return [];
+    const out = [];
+    for (const e of sess.moveLog) {
+        const f = e?.from, t = e?.to;
+        if (!f || !t) return [];
+        const from = f.type === "column"
+            ? { type: "column", index: f.colIndex, startIndex: f.startIndex }
+            : f.type === "freecell"
+                ? { type: "freecell", index: f.freecellIndex }
+                : { type: "foundation", index: f.foundationIndex };
+        const to = t.type === "column"
+            ? { type: "column", index: t.colIndex }
+            : t.type === "freecell"
+                ? { type: "freecell", index: t.freecellIndex }
+                : { type: "foundation", index: t.foundationIndex };
+        const m = normalizeSupportMove({ from, to, cards: Array.isArray(e.cards) ? e.cards : [] });
+        if (!m) return [];
+        out.push(m);
+    }
+    return out;
+}
+async function solveFreeCellSeed(level, seed) {
+    const temp = new session_1.GameSession("freecell", level, seed >>> 0);
+    const cached = loadSolutionCache(level, seed, temp.dealVersion);
+    if (cached?.length) return { moves: cached, dealVersion: temp.dealVersion, cached: true };
+    const result = await (0, freecellSolver_1.solveFreeCellState)(temp.state, { maxMs: 5000, maxNodes: 520000 });
+    if (!result?.ok || !Array.isArray(result.moves) || !result.moves.length) return null;
+    // GameSession本体のルールで全手を再実行して、必ずクリアまで到達することを二重検証する。
+    if (!prepareSupportRoute(temp, result.moves)) { clearSupportRuntime(); return null; }
+    const verifiedMoves = supportRoute.slice();
+    clearSupportRuntime();
+    saveSolutionCache(level, seed, temp.dealVersion, verifiedMoves);
+    return { moves: verifiedMoves, dealVersion: temp.dealVersion, cached: false };
+}
+async function resolveSupportedFreeCell(level) {
+    startBusy = true;
+    try {
+        const dealV = (0, dealVersion_1.getDealVersion)("freecell");
+        // まず既存のクリア保証seedを1件解析する。既にローカル解析済みなら即開始できる。
+        menuNetworkStatus = "サポート用クリアルートを解析中...";
+        if (screen === "menu") rerender();
+        try {
+            const got = await (0, clearSeedApi_1.fetchGuaranteedSeed)("freecell", level, dealV);
+            if (got) {
+                const solved = await solveFreeCellSeed(level, got.seed);
+                if (solved) return { seed: got.seed >>> 0, source: "guaranteed", supportMoves: solved.moves };
+            }
+        } catch (err) { log(`[SUPPORT ${ts()}] guaranteed seed solve failed`, err); }
+        // 既存seedで解法を見つけられない場合は、ランダムseedを生成して実際に完走できたものだけ採用する。
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            const seed = Math.floor(Math.random() * 2 ** 32) >>> 0;
+            menuNetworkStatus = `解法付きseedを生成中... ${attempt}/4`;
+            if (screen === "menu") rerender();
+            const solved = await solveFreeCellSeed(level, seed);
+            if (!solved) continue;
+            // ソルバーで完走確認できたseedは通常のクリア保証共有庫にも登録する。
+            try { await (0, clearSeedApi_1.registerVerifiedSeed)("freecell", level, seed, solved.dealVersion, solved.moves.length); }
+            catch (err) { log(`[SUPPORT ${ts()}] verified seed upload failed`, err); }
+            return { seed, source: "guaranteed", supportMoves: solved.moves };
+        }
+        menuNetworkStatus = "この条件ではクリアルートを見つけられませんでした。もう一度お試しください";
+        return null;
+    } finally {
+        startBusy = false;
+        if (screen === "menu") rerender();
+    }
+}
+
 async function resolveSeedForStart(mode, level) {
+    if (mode === "freecell" && clearGuaranteeEnabled && freecellSupportEnabled) {
+        return await resolveSupportedFreeCell(level);
+    }
     if (!clearGuaranteeEnabled) {
         return {
             seed: Math.floor(Math.random() * 2 ** 32) >>> 0,
@@ -4391,7 +4885,7 @@ async function resolveSeedForStart(mode, level) {
             rerender();
     }
 }
-function beginSession(mode, level, seed, source, logKind) {
+function beginSession(mode, level, seed, source, logKind, supportMoves = null) {
     cancelFinishingNoMsg();
     const animObj = window.spiderAnim;
     if (animObj) {
@@ -4409,6 +4903,15 @@ function beginSession(mode, level, seed, source, logKind) {
         playerName = (0, playerStatsStore_1.savePlayerName)(currentRunPlayerName);
     }
     session = new session_1.GameSession(mode, level, seed >>> 0);
+    clearSupportRuntime();
+    if (mode === "freecell" && freecellSupportEnabled && Array.isArray(supportMoves) && supportMoves.length) {
+        if (prepareSupportRoute(session, supportMoves)) {
+            log(`[SUPPORT ${ts()}] route ready ${supportRoute.length} moves`);
+        } else {
+            clearSupportRuntime();
+            log(`[SUPPORT ${ts()}] route verification failed`);
+        }
+    }
     uiState = {
         selectedFrom: undefined,
         statusText: source === "guaranteed" ? "クリア保証seed" : "",
@@ -4436,7 +4939,8 @@ async function chooseNewGameOption(opt) {
     if (opt === "retry") {
         const seed = session.seed >>> 0;
         const source = currentSeedSource;
-        beginSession(mode, session.level, seed, source, "NEW");
+        const route = mode === "freecell" && supportRoute ? supportRoute.slice() : null;
+        beginSession(mode, session.level, seed, source, "NEW", route);
         return;
     }
     if (opt === "level1")
@@ -4453,13 +4957,13 @@ async function chooseNewGameOption(opt) {
         rerender();
         return;
     }
-    beginSession(mode, targetLevel, resolved.seed, resolved.source, "NEW");
+    beginSession(mode, targetLevel, resolved.seed, resolved.source, "NEW", resolved.supportMoves || null);
 }
 async function startGame(mode, level) {
     const resolved = await resolveSeedForStart(mode, level);
     if (!resolved)
         return;
-    beginSession(mode, level, resolved.seed, resolved.source, "START");
+    beginSession(mode, level, resolved.seed, resolved.source, "START", resolved.supportMoves || null);
 }
 function backToMenu() {
     cancelFinishingNoMsg();
@@ -4471,6 +4975,7 @@ function backToMenu() {
             animObj.timer = null;
         }
     }
+    clearSupportRuntime();
     screen = "menu";
     uiState = {
         selectedFrom: undefined,
@@ -4501,6 +5006,7 @@ function clearReplayLevelSelect() {
             animObj.timer = null;
         }
     }
+    clearSupportRuntime();
     screen = "menu";
     session = null;
     uiState = {
@@ -4853,6 +5359,7 @@ function rerender() {
         ensureMenuStatsLoaded();
         (0, renderMenuScreen_1.renderMenuScreen)(rootEl, pendingMode, {
             guaranteeEnabled: clearGuaranteeEnabled,
+            supportEnabled: freecellSupportEnabled,
             pendingSeedCount: (0, clearSeedApi_1.pendingClearSeedCount)(),
             statusText: menuNetworkStatus,
             startBusy,
@@ -4873,10 +5380,26 @@ function rerender() {
             },
             onToggleGuarantee: () => {
                 clearGuaranteeEnabled = !clearGuaranteeEnabled;
+                if (!clearGuaranteeEnabled && freecellSupportEnabled) {
+                    freecellSupportEnabled = false;
+                    saveFreeCellSupportEnabled(false);
+                }
                 (0, clearGuaranteeSetting_1.saveClearGuaranteeEnabled)(clearGuaranteeEnabled);
                 menuNetworkStatus = clearGuaranteeEnabled
                     ? "クリア保証をONにしました"
                     : "通常ランダムに戻しました";
+                rerender();
+            },
+            onToggleSupport: () => {
+                freecellSupportEnabled = !freecellSupportEnabled;
+                saveFreeCellSupportEnabled(freecellSupportEnabled);
+                if (freecellSupportEnabled && !clearGuaranteeEnabled) {
+                    clearGuaranteeEnabled = true;
+                    (0, clearGuaranteeSetting_1.saveClearGuaranteeEnabled)(true);
+                }
+                menuNetworkStatus = freecellSupportEnabled
+                    ? "FreeCellサポートをONにしました"
+                    : "FreeCellサポートをOFFにしました";
                 rerender();
             },
             onStartGame: (mode, level) => {
@@ -4923,6 +5446,7 @@ function rerender() {
         const gameCleared = !!uiState.cleared || gameClearedNow;
         const readyForFinish = computeReadyForFinish(session);
         if (session.mode === "freecell") {
+            syncSupportPosition();
             const stFC = session.state;
             const maxLen = (0, rules_1.calcMaxMovableLen)(stFC);
             const movableColumns = {};
@@ -4988,7 +5512,8 @@ function rerender() {
                 freecells: highlightFree,
                 foundations: highlightFound
             };
-            (0, renderGameScreen_1.renderGameScreen)(rootEl, session, uiState, movableMap, highlightMap, readyForFinish, finishing, gameCleared, {
+            const supportUi = { ...uiState, supportEnabled: !!supportRoute, supportStep: supportRouteIndex, supportTotal: supportRoute?.length || 0, supportOffRoute };
+            (0, renderGameScreen_1.renderGameScreen)(rootEl, session, supportUi, movableMap, highlightMap, readyForFinish, finishing, gameCleared, {
                 onBackToMenu: () => backToMenu(),
                 onUndoClick: () => undoOneMove(),
                 onFinishClick: () => startFinishing(),
@@ -5044,8 +5569,10 @@ function rerender() {
                 onClickDestination: (destRef) => clickDestinationGeneric(destRef),
                 onAutoToFoundation: (srcRef) => autoToFoundationGeneric(srcRef),
                 onDragStart: (srcRef, ev) => startDragWithDblclickGuard(srcRef, ev),
+                onSupportHintClick: () => onSupportHintClick(),
                 onEmptyBoardClick: () => emptyBoardClick(),
             });
+            setTimeout(() => applySupportHintDom(), 0);
             afterRenderScale();
             return;
         }
@@ -5181,6 +5708,7 @@ function saveClearGuaranteeEnabled(enabled) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.flushPendingClearedSeeds = flushPendingClearedSeeds;
 exports.fetchGuaranteedSeed = fetchGuaranteedSeed;
+exports.registerVerifiedSeed = registerVerifiedSeed;
 exports.pendingClearSeedCount = pendingClearSeedCount;
 exports.identityForRecord = identityForRecord;
 const config_1 = require("../config");
@@ -5266,6 +5794,17 @@ async function fetchGuaranteedSeed(mode, level, dealVersion) {
         seed: seed >>> 0,
         count: Number.isFinite(count) ? count | 0 : 0,
     };
+}
+/** ソルバーが実際に完走したFreeCell seedをクリア保証共有庫へ登録する。 */
+async function registerVerifiedSeed(mode, level, seed, dealVersion, moves) {
+    const record = {
+        tsMs: Date.now(), mode, level: level | 0, seed: seed >>> 0,
+        dealVersion: dealVersion | 0, moves: Math.max(0, moves | 0), durMs: 0,
+    };
+    const body = await fetchJson("/api/clear-seeds/batch", {
+        method: "POST", body: JSON.stringify({ records: [record] }),
+    });
+    return !!body?.ok;
 }
 function pendingClearSeedCount() {
     return (0, clearSeedStore_1.listPendingClearedSeeds)().length;
@@ -5970,13 +6509,24 @@ function buildTopBar(session, opts, handlers) {
     log.style.overflow = "hidden";
     log.style.textOverflow = "ellipsis";
     center.appendChild(log);
-    // ---- 右：mode表示 / FINISH ----
+    // ---- 右：サポート / mode表示 / FINISH ----
     const right = document.createElement("div");
     right.className = "topbar-right";
     right.style.display = "flex";
     right.style.alignItems = "center";
     right.style.gap = "8px";
     right.style.flex = "0 0 auto";
+    if (opts.supportEnabled && typeof handlers.onSupportHintClick === "function") {
+        const progress = document.createElement("div");
+        progress.className = "support-progress";
+        progress.textContent = `ルート ${Math.min(opts.supportStep || 0, opts.supportTotal || 0)}/${opts.supportTotal || 0}`;
+        right.appendChild(progress);
+        const hint = document.createElement("button");
+        hint.className = `support-hint-btn ${opts.supportOffRoute ? "offroute" : ""}`;
+        hint.textContent = opts.supportOffRoute ? "ルート復帰" : "ヒント";
+        hint.addEventListener("click", handlers.onSupportHintClick);
+        right.appendChild(hint);
+    }
     const modeLabel = document.createElement("div");
     modeLabel.textContent = `mode: ${session.mode}`;
     right.appendChild(modeLabel);
@@ -6425,6 +6975,7 @@ function sameSrc(a, b) {
 function createCardDiv(card, topOffset, canDragHead, highlight, sourceRef, allowAutoToFound, handlers, plainClickHandler) {
     const div = document.createElement("div");
     div.className = (0, cardText_1.cardCssClassByColor)(card.color);
+    div.dataset.cardId = String(card.id || "");
     if (canDragHead)
         div.classList.add("card-head");
     if (highlight)
@@ -6500,11 +7051,16 @@ function renderGameScreen(root, session, ui, movableMap, highlightMap, readyForF
         readyForFinish,
         finishing,
         gameCleared,
+        supportEnabled: !!ui.supportEnabled,
+        supportStep: Number(ui.supportStep || 0),
+        supportTotal: Number(ui.supportTotal || 0),
+        supportOffRoute: !!ui.supportOffRoute,
     }, {
         onBackToMenu: () => handlers.onBackToMenu(),
         onNewGameClick: () => handlers.onNewGameClick(),
         onUndoClick: () => handlers.onUndoClick(),
         onFinishClick: () => handlers.onFinishClick(), // FreeCellはFINISH対応
+        onSupportHintClick: handlers.onSupportHintClick,
     });
     frame.appendChild(topBar);
     // --- 盤面本体 ---
@@ -7144,6 +7700,23 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
         : "通常のランダムseedで開始します";
     guaranteeWrap.appendChild(guaranteeDesc);
     screen.appendChild(guaranteeWrap);
+    if (pendingMode === "freecell") {
+        const supportWrap = document.createElement("div");
+        supportWrap.className = "guarantee-wrap";
+        const supportBtn = document.createElement("button");
+        supportBtn.className = `support-toggle ${opts.supportEnabled ? "on" : "off"}`;
+        supportBtn.textContent = `サポート: ${opts.supportEnabled ? "ON" : "OFF"}`;
+        supportBtn.disabled = !!opts.startBusy;
+        supportBtn.addEventListener("click", handlers.onToggleSupport);
+        supportWrap.appendChild(supportBtn);
+        const supportDesc = document.createElement("div");
+        supportDesc.className = "support-desc";
+        supportDesc.textContent = opts.supportEnabled
+            ? "解法を実際に検証したseedで開始し、ヒントから次の一手を確認できます"
+            : "ONにするとクリア保証もONになり、FreeCellのクリアルートを解析します";
+        supportWrap.appendChild(supportDesc);
+        screen.appendChild(supportWrap);
+    }
     const levelList = document.createElement("div");
     levelList.className = "menu-list";
     for (const level of [1, 2, 3]) {
@@ -7155,7 +7728,7 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
         levelList.appendChild(b);
     }
     screen.appendChild(levelList);
-    if (opts.statusText && (opts.startBusy || opts.statusText.includes("クリア保証"))) {
+    if (opts.statusText && (opts.startBusy || opts.statusText.includes("クリア保証") || opts.statusText.includes("サポート") || opts.statusText.includes("解法"))) {
         const status = document.createElement("div");
         status.className = "seed-sync-status";
         status.textContent = opts.statusText;
