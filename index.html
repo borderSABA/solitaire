@@ -1155,7 +1155,7 @@ body {
   border-radius:6px; padding:6px 10px; font-weight:800; cursor:pointer;
 }
 .support-hint-btn.offroute { background:#4a2d16; border-color:#ffb14d; color:#ffd08a; }
-.card.support-hint-source, .stock-slot.support-hint-source {
+.card.support-hint-source, .stock-slot.support-hint-source, .spider-board .slot.support-hint-source {
   outline: 4px solid #ffd43b !important;
   outline-offset: -2px;
   box-shadow: 0 0 18px rgba(255,212,59,.9) !important;
@@ -1177,7 +1177,7 @@ body {
 </head>
 <body>
 <div id="felt-wrapper"><div id="game-scale-wrapper"><div id="app"></div></div></div>
-<div id="version-badge" class="version-badge" aria-label="version">v1.5.2</div>
+<div id="version-badge" class="version-badge" aria-label="version">v1.5.3</div>
 <script>
 (function(){
 "use strict";
@@ -3671,7 +3671,9 @@ let spiderSupportEnabled = loadSpiderSupportEnabled();
 let supportMode = null;
 let supportRoute = null;
 let supportRouteStateKeys = [];
+let supportRouteStates = [];
 let supportRouteKeyToIndex = new Map();
+let supportSpiderCanonicalKeyToIndices = new Map();
 let supportRouteIndex = 0;
 let supportOffRoute = false;
 let supportHintVisible = false;
@@ -5294,9 +5296,68 @@ function klondikeStateKey(state) {
         klondikeFoundationProgressKey(state);
 }
 function spiderCardKey(c) { return c ? `${c.suit}${c.rank}${c.faceUp ? "u" : "d"}` : "-"; }
+function spiderColumnSupportKey(col) {
+    return (col || []).map(spiderCardKey).join(".");
+}
 function spiderStateKey(state) {
     return `${Number(state.completedStacks || 0)};${(state.stock || []).map(spiderCardKey).join(".")};` +
-        (state.columns || []).map(col => col.map(spiderCardKey).join(".")).join("|");
+        (state.columns || []).map(spiderColumnSupportKey).join("|");
+}
+// Spiderでは列の左右位置そのものに意味はない。
+// 空列をどこに作ったか等で物理列が入れ替わっても同じ攻略状態として追跡する。
+function spiderCanonicalStateKey(state) {
+    const cols = (state.columns || []).map(spiderColumnSupportKey).sort();
+    return `${Number(state.completedStacks || 0)};${(state.stock || []).map(spiderCardKey).join(".")};${cols.join("|")}`;
+}
+function nearestSupportIndex(indices) {
+    if (!Array.isArray(indices) || !indices.length) return undefined;
+    let best = indices[0], bestDist = Math.abs(best - supportRouteIndex);
+    for (let i = 1; i < indices.length; i++) {
+        const idx = indices[i], dist = Math.abs(idx - supportRouteIndex);
+        if (dist < bestDist || (dist === bestDist && idx >= supportRouteIndex && best < supportRouteIndex)) {
+            best = idx; bestDist = dist;
+        }
+    }
+    return best;
+}
+function findSpiderSupportRouteIndex(state) {
+    const exact = supportRouteKeyToIndex.get(spiderStateKey(state));
+    if (exact !== undefined) return exact;
+    return nearestSupportIndex(supportSpiderCanonicalKeyToIndices.get(spiderCanonicalStateKey(state)));
+}
+function mapSpiderSupportMoveToCurrent(move) {
+    if (!session || session.mode !== "spider" || !move || move.kind !== "move") return move;
+    const expected = supportRouteStates[supportRouteIndex];
+    const current = session.state;
+    if (!expected || !current) return move;
+    if (spiderStateKey(expected) === spiderStateKey(current)) return move;
+    if (spiderCanonicalStateKey(expected) !== spiderCanonicalStateKey(current)) return move;
+
+    const expectedCols = expected.columns || [];
+    const currentCols = current.columns || [];
+    const fromSig = spiderColumnSupportKey(expectedCols[move.from.index] || []);
+    const toSig = spiderColumnSupportKey(expectedCols[move.to.index] || []);
+    const fromCandidates = [];
+    const toCandidates = [];
+    for (let i = 0; i < currentCols.length; i++) {
+        const sig = spiderColumnSupportKey(currentCols[i]);
+        if (sig === fromSig) fromCandidates.push(i);
+        if (sig === toSig) toCandidates.push(i);
+    }
+    if (!fromCandidates.length || !toCandidates.length) return move;
+    // 同一内容の列が複数ある場合でも、移動元と移動先が同じ物理列にならない組を選ぶ。
+    let fromIndex = fromCandidates[0], toIndex = toCandidates[0];
+    outer: for (const f of fromCandidates) {
+        for (const t of toCandidates) {
+            if (f !== t) { fromIndex = f; toIndex = t; break outer; }
+        }
+    }
+    return { ...move, from: { ...move.from, index: fromIndex }, to: { ...move.to, index: toIndex } };
+}
+function currentSupportMove() {
+    if (!supportRoute || supportRouteIndex >= supportRoute.length) return null;
+    const move = supportRoute[supportRouteIndex];
+    return supportMode === "spider" ? mapSpiderSupportMoveToCurrent(move) : move;
 }
 function currentSupportStateKey(sess) {
     if (!sess) return "";
@@ -5309,7 +5370,9 @@ function clearSupportRuntime() {
     supportMode = null;
     supportRoute = null;
     supportRouteStateKeys = [];
+    supportRouteStates = [];
     supportRouteKeyToIndex = new Map();
+    supportSpiderCanonicalKeyToIndices = new Map();
     supportRouteIndex = 0;
     supportOffRoute = false;
     supportHintVisible = false;
@@ -5516,6 +5579,7 @@ function prepareSupportRoute(sess, moves) {
     } else if (sess.mode === "spider") {
         let state = JSON.parse(JSON.stringify(sess.state));
         const keys = [spiderStateKey(state)];
+        const states = [JSON.parse(JSON.stringify(state))];
         const normalizedMoves = [];
         for (const raw of moves) {
             const m = normalizeSpiderSupportMove(raw);
@@ -5525,16 +5589,27 @@ function prepareSupportRoute(sess, moves) {
             state = next;
             normalizedMoves.push(m);
             keys.push(spiderStateKey(state));
+            states.push(JSON.parse(JSON.stringify(state)));
         }
         if (Number(state.completedStacks || 0) !== 8 || (state.stock || []).length || state.columns.some(col => col.length)) return false;
         supportMode = "spider";
         supportRoute = normalizedMoves;
         supportRouteStateKeys = keys;
+        supportRouteStates = states;
     } else {
         return false;
     }
     supportRouteKeyToIndex = new Map();
     supportRouteStateKeys.forEach((k, i) => supportRouteKeyToIndex.set(k, i));
+    supportSpiderCanonicalKeyToIndices = new Map();
+    if (supportMode === "spider" && supportRouteStates.length) {
+        supportRouteStates.forEach((st, i) => {
+            const key = spiderCanonicalStateKey(st);
+            const arr = supportSpiderCanonicalKeyToIndices.get(key) || [];
+            arr.push(i);
+            supportSpiderCanonicalKeyToIndices.set(key, arr);
+        });
+    }
     supportRouteIndex = 0;
     supportOffRoute = false;
     supportHintVisible = true;
@@ -5542,8 +5617,9 @@ function prepareSupportRoute(sess, moves) {
 }
 function syncSupportPosition() {
     if (!session || !supportRoute || supportMode !== session.mode) return;
-    const key = currentSupportStateKey(session);
-    const idx = supportRouteKeyToIndex.get(key);
+    const idx = session.mode === "spider"
+        ? findSpiderSupportRouteIndex(session.state)
+        : supportRouteKeyToIndex.get(currentSupportStateKey(session));
     if (idx === undefined) {
         supportOffRoute = true;
     } else {
@@ -5598,7 +5674,8 @@ function klondikeSupportFoundationTargets(move) {
 function applySupportHintDom() {
     document.querySelectorAll(".support-hint-source,.support-hint-dest,.support-hint-dest-card").forEach(el => el.classList.remove("support-hint-source", "support-hint-dest", "support-hint-dest-card"));
     if (!supportHintVisible || !supportRoute || supportOffRoute || supportRouteIndex >= supportRoute.length || !session || supportMode !== session.mode) return;
-    const move = supportRoute[supportRouteIndex];
+    const move = currentSupportMove();
+    if (!move) return;
     if (session.mode === "klondike" && move.kind === "draw") {
         const stock = document.querySelector('[data-stock="1"]');
         if (stock) stock.classList.add("support-hint-source");
@@ -5676,12 +5753,15 @@ function applySupportHintDom() {
 }
 function restoreSupportRoute() {
     if (!session || !supportRoute || supportMode !== session.mode) return;
+    const isOnRoute = () => session.mode === "spider"
+        ? findSpiderSupportRouteIndex(session.state) !== undefined
+        : supportRouteKeyToIndex.has(currentSupportStateKey(session));
     let restored = false;
     while (session.undoStack?.length) {
-        if (supportRouteKeyToIndex.has(currentSupportStateKey(session))) { restored = true; break; }
+        if (isOnRoute()) { restored = true; break; }
         if (!session.undo()) break;
     }
-    if (supportRouteKeyToIndex.has(currentSupportStateKey(session))) restored = true;
+    if (isOnRoute()) restored = true;
     if (restored) {
         syncSupportPosition();
         uiState.selectedFrom = undefined;
@@ -5698,7 +5778,8 @@ function onSupportHintClick() {
     if (supportOffRoute) { restoreSupportRoute(); return; }
     if (supportRouteIndex >= supportRoute.length) { uiState.statusText = "サポートルート完了です"; rerender(); return; }
     supportHintVisible = true;
-    uiState.statusText = `次の手 ${supportRouteIndex + 1}/${supportRoute.length}: ${supportMoveLabel(supportRoute[supportRouteIndex])}`;
+    const move = currentSupportMove();
+    uiState.statusText = `次の手 ${supportRouteIndex + 1}/${supportRoute.length}: ${supportMoveLabel(move)}`;
     rerender();
 }
 function loadSolutionCache(level, seed, dealVersion) {
