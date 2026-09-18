@@ -1177,7 +1177,7 @@ body {
 </head>
 <body>
 <div id="felt-wrapper"><div id="game-scale-wrapper"><div id="app"></div></div></div>
-<div id="version-badge" class="version-badge" aria-label="version">v1.4.0</div>
+<div id="version-badge" class="version-badge" aria-label="version">v1.5.0</div>
 <script>
 (function(){
 "use strict";
@@ -2521,6 +2521,215 @@ function autoSweepSafeStepSpider(state) {
 }
 
 },
+"core/spider/solver.js": function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.solveSpiderState = solveSpiderState;
+/**
+ * Spider専用ビーム探索。
+ * 最短証明は行わず、制限時間内に最後まで完走したルートだけ返す。
+ * 未解決は「解けない」ではなく「今回の探索上限では未解決」として扱う。
+ */
+function solverWorkerMain() {
+  const SUIT_INDEX = { S: 0, H: 1, D: 2, C: 3 };
+  const SUITS = ["S", "H", "D", "C"];
+  const rank = c => (c % 13) + 1;
+  const suit = c => (c / 13) | 0;
+  const code = c => (SUIT_INDEX[c.suit] * 13) + (c.rank - 1);
+  const idOf = c => `${SUITS[suit(c)]}${rank(c)}#0`;
+  const clone = st => ({ cols: st.cols.map(c => c.slice()), up: st.up.slice(), stock: st.stock.slice(), completed: st.completed });
+  function fromInput(input) {
+    const cols = input.columns.map(col => col.map(code));
+    const up = input.columns.map(col => {
+      const i = col.findIndex(c => !!c.faceUp);
+      return i < 0 ? col.length : i;
+    });
+    return { cols, up, stock: input.stock.map(code), completed: Number(input.completedStacks || 0) | 0 };
+  }
+  function normalize(st) {
+    while (true) {
+      let changed = false;
+      for (let ci = 0; ci < 10; ci++) {
+        const col = st.cols[ci];
+        if (col.length < 13) continue;
+        const start = col.length - 13;
+        const su = suit(col[start]);
+        let ok = true;
+        for (let i = 0; i < 13; i++) {
+          const c = col[start + i];
+          if (suit(c) !== su || rank(c) !== 13 - i) { ok = false; break; }
+        }
+        if (!ok) continue;
+        col.splice(start, 13);
+        st.completed++;
+        if (col.length && st.up[ci] >= col.length) st.up[ci] = col.length - 1;
+        else if (!col.length) st.up[ci] = 0;
+        changed = true;
+        break;
+      }
+      if (!changed) break;
+    }
+    return st;
+  }
+  function stateKey(st) {
+    return `${st.completed};${st.stock.join(",")};` + st.cols.map((c, i) => `${st.up[i]}:${c.join(".")}`).join("|");
+  }
+  function movableStarts(col, u) {
+    if (!col.length) return [];
+    const out = [col.length - 1];
+    for (let i = col.length - 2; i >= u; i--) {
+      if (suit(col[i]) === suit(col[i + 1]) && rank(col[i]) === rank(col[i + 1]) + 1) out.push(i);
+      else break;
+    }
+    return out;
+  }
+  function apply(st, m) {
+    const ns = clone(st);
+    if (m.kind === "deal") {
+      if (ns.stock.length < 10 || ns.cols.some(c => !c.length)) return null;
+      for (let ci = 0; ci < 10; ci++) ns.cols[ci].push(ns.stock.pop());
+      return normalize(ns);
+    }
+    const src = ns.cols[m.from], dst = ns.cols[m.to];
+    if (!src || !dst || m.start < ns.up[m.from] || m.start < 0 || m.start >= src.length) return null;
+    for (let i = m.start; i < src.length - 1; i++) {
+      if (suit(src[i]) !== suit(src[i + 1]) || rank(src[i]) !== rank(src[i + 1]) + 1) return null;
+    }
+    const head = src[m.start];
+    if (dst.length && rank(head) !== rank(dst[dst.length - 1]) - 1) return null;
+    dst.push(...src.splice(m.start));
+    if (src.length && ns.up[m.from] >= src.length) ns.up[m.from] = src.length - 1;
+    else if (!src.length) ns.up[m.from] = 0;
+    return normalize(ns);
+  }
+  function metrics(st) {
+    let hidden = 0, same = 0, desc = 0, empty = 0, clean = 0, topMob = 0;
+    for (let ci = 0; ci < 10; ci++) {
+      const c = st.cols[ci];
+      hidden += Math.min(st.up[ci], c.length);
+      if (!c.length) { empty++; continue; }
+      let topRun = 1;
+      for (let i = c.length - 2; i >= st.up[ci]; i--) {
+        if (rank(c[i]) === rank(c[i + 1]) + 1) {
+          desc++;
+          if (suit(c[i]) === suit(c[i + 1])) { same++; topRun++; }
+          else break;
+        } else break;
+      }
+      clean += topRun * topRun;
+      topMob += topRun;
+    }
+    return { hidden, same, desc, empty, clean, topMob };
+  }
+  function score(st) {
+    const m = metrics(st);
+    // face-downを減らすことを最優先。山札が残り、裏札が0なら空列を一旦埋めて次のdealへ進みやすくする。
+    const emptyTerm = st.stock.length ? (m.hidden === 0 ? -30000 : 10000) : 18000;
+    return st.completed * 10000000 - m.hidden * 150000 - st.stock.length * 7000 +
+      m.empty * emptyTerm + m.same * 1800 + m.clean * 100 + m.topMob * 80;
+  }
+  function outputMove(st, raw) {
+    if (raw.kind === "deal") return { kind: "deal" };
+    const head = st.cols[raw.from][raw.start];
+    return {
+      kind: "move",
+      from: { type: "tableau", index: raw.from, startIndex: raw.start },
+      to: { type: "tableau", index: raw.to },
+      cards: head == null ? [] : [idOf(head)],
+    };
+  }
+  function candidates(st) {
+    const out = [];
+    const empties = [];
+    for (let i = 0; i < 10; i++) if (!st.cols[i].length) empties.push(i);
+    const emptyTarget = empties.length ? empties[0] : -1; // 空列は対称なので代表1列
+    for (let from = 0; from < 10; from++) {
+      const col = st.cols[from];
+      if (!col.length) continue;
+      for (const start of movableStarts(col, st.up[from])) {
+        const head = col[start];
+        for (let to = 0; to < 10; to++) {
+          if (to === from) continue;
+          const dst = st.cols[to];
+          if (!dst.length) {
+            if (to !== emptyTarget) continue;
+          } else if (rank(head) !== rank(dst[dst.length - 1]) - 1) continue;
+          const raw = { kind: "move", from, start, to };
+          const next = apply(st, raw);
+          if (next) out.push({ state: next, move: outputMove(st, raw), score: score(next) });
+        }
+      }
+    }
+    if (st.stock.length >= 10 && !st.cols.some(c => !c.length)) {
+      const raw = { kind: "deal" };
+      const next = apply(st, raw);
+      if (next) out.push({ state: next, move: { kind: "deal" }, score: score(next) });
+    }
+    return out;
+  }
+  function solve(input, options) {
+    const maxMs = Math.max(500, Number(options.maxMs || 10000));
+    const maxNodes = Math.max(10000, Number(options.maxNodes || 1800000) | 0);
+    const maxDepth = Math.max(120, Number(options.maxDepth || 380) | 0);
+    const beamWidth = Math.max(100, Number(options.beamWidth || 900) | 0);
+    const started = Date.now();
+    let expanded = 0;
+    const init = normalize(fromInput(input));
+    let frontier = [{ state: init, path: [] }];
+    const seen = new Map([[stateKey(init), 0]]);
+    let best = { score: score(init), completed: init.completed, hidden: metrics(init).hidden, stock: init.stock.length };
+    for (let depth = 0; depth < maxDepth && frontier.length; depth++) {
+      const nextFrontier = [];
+      for (const node of frontier) {
+        for (const item of candidates(node.state)) {
+          expanded++;
+          if ((expanded & 1023) === 0 && (expanded >= maxNodes || Date.now() - started >= maxMs)) {
+            return { ok: false, moves: [], nodes: expanded, elapsedMs: Date.now() - started, optimal: false, best };
+          }
+          const k = stateKey(item.state);
+          const old = seen.get(k);
+          if (old !== undefined && old <= depth + 1) continue;
+          seen.set(k, depth + 1);
+          const path = node.path.concat([item.move]);
+          if (item.state.completed >= 8 && !item.state.stock.length && item.state.cols.every(c => !c.length)) {
+            return { ok: true, moves: path, nodes: expanded, elapsedMs: Date.now() - started, optimal: false };
+          }
+          const mm = metrics(item.state);
+          if (item.score > best.score) best = { score: item.score, completed: item.state.completed, hidden: mm.hidden, stock: item.state.stock.length };
+          nextFrontier.push({ state: item.state, path, score: item.score });
+        }
+      }
+      nextFrontier.sort((a, b) => b.score - a.score);
+      frontier = nextFrontier.slice(0, beamWidth);
+      if (Date.now() - started >= maxMs || expanded >= maxNodes) break;
+    }
+    return { ok: false, moves: [], nodes: expanded, elapsedMs: Date.now() - started, optimal: false, best };
+  }
+  self.onmessage = ev => {
+    try { self.postMessage({ id: ev.data.id, result: solve(ev.data.state, ev.data.options || {}) }); }
+    catch (err) { self.postMessage({ id: ev.data.id, error: String(err?.stack || err) }); }
+  };
+}
+let solverSeq = 0;
+function solveSpiderState(state, options = {}) {
+  return new Promise((resolve, reject) => {
+    const source = `(${solverWorkerMain.toString()})();`;
+    const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    const worker = new Worker(url);
+    const id = ++solverSeq;
+    const cleanup = () => { worker.terminate(); URL.revokeObjectURL(url); };
+    worker.onmessage = ev => {
+      if (ev.data?.id !== id) return;
+      cleanup();
+      if (ev.data?.error) reject(new Error(ev.data.error));
+      else resolve(ev.data.result);
+    };
+    worker.onerror = ev => { cleanup(); reject(new Error(ev.message || "Spider solver worker error")); };
+    worker.postMessage({ id, state: JSON.parse(JSON.stringify(state)), options });
+  });
+}
+
+},
 "core/spider/state.js": function(module, exports, require) {
 "use strict";
 // core/spider/state.ts
@@ -3308,6 +3517,7 @@ const klondikeSolver_1 = require("../core/klondike/solver");
 const renderKlondikeScreen_1 = require("./ui/renderKlondikeScreen");
 // ===== Spider側 =====
 const renderSpiderScreen_1 = require("./ui/renderSpiderScreen");
+const spiderSolver_1 = require("../core/spider/solver");
 // ===== メニュー =====
 const renderMenuScreen_1 = require("./ui/renderMenuScreen");
 const clearSeedStore_1 = require("./services/clearSeedStore");
@@ -3337,12 +3547,19 @@ const FREECELL_SOLUTION_CACHE_KEY = "SolitaireFreeCellSolutionCacheV1";
 const KLONDIKE_SUPPORT_KEY = "SolitaireKlondikeSupportV1";
 const KLONDIKE_SOLUTION_CACHE_KEY = "SolitaireKlondikeSolutionCacheV1";
 const KLONDIKE_SOLVER_VERSION = 1;
+const FREECELL_SOLVER_VERSION = 1;
+const SPIDER_SUPPORT_KEY = "SolitaireSpiderSupportV1";
+const SPIDER_SOLUTION_CACHE_KEY = "SolitaireSpiderSolutionCacheV1";
+const SPIDER_SOLVER_VERSION = 1;
 function loadFreeCellSupportEnabled() { try { return localStorage.getItem(FREECELL_SUPPORT_KEY) === "1"; } catch { return false; } }
 function saveFreeCellSupportEnabled(v) { try { localStorage.setItem(FREECELL_SUPPORT_KEY, v ? "1" : "0"); } catch {} }
 function loadKlondikeSupportEnabled() { try { return localStorage.getItem(KLONDIKE_SUPPORT_KEY) === "1"; } catch { return false; } }
 function saveKlondikeSupportEnabled(v) { try { localStorage.setItem(KLONDIKE_SUPPORT_KEY, v ? "1" : "0"); } catch {} }
+function loadSpiderSupportEnabled() { try { return localStorage.getItem(SPIDER_SUPPORT_KEY) === "1"; } catch { return false; } }
+function saveSpiderSupportEnabled(v) { try { localStorage.setItem(SPIDER_SUPPORT_KEY, v ? "1" : "0"); } catch {} }
 let freecellSupportEnabled = loadFreeCellSupportEnabled();
 let klondikeSupportEnabled = loadKlondikeSupportEnabled();
+let spiderSupportEnabled = loadSpiderSupportEnabled();
 let supportMode = null;
 let supportRoute = null;
 let supportRouteStateKeys = [];
@@ -3361,6 +3578,9 @@ const solverToolsVisible = new URLSearchParams(location.search).get("solvetools"
 let solverToolsBusy = false;
 let solverToolsStopRequested = false;
 let solverToolsStatus = "";
+let solverToolsSelectedMode = "freecell";
+let solverToolsSelectedLevel = 1;
+let solverToolsTargetCount = 10;
 let playerName = (0, playerStatsStore_1.loadPlayerName)();
 let menuTotalClearCount = null;
 let menuStatsLoadedFor = "";
@@ -4038,6 +4258,8 @@ function spiderAfterMutation() {
         return;
     const run = spiderFindCompleteRun(st);
     if (!run) {
+        const hadSpiderSupport = supportMode === "spider" && !!supportRoute;
+        if (hadSpiderSupport) syncSupportPosition();
         if (isFullyClearedSpider(st) && !uiState.cleared) {
             cancelFinishingNoMsg();
             uiState.cleared = true;
@@ -4046,7 +4268,10 @@ function spiderAfterMutation() {
             const report = session.buildClearReport(true);
             console.log("CLEAR REPORT:", report);
             rerender();
+            return;
         }
+        // 正解手のたびに次のヒントへ即更新する。
+        if (hadSpiderSupport) rerender();
         return;
     }
     const { colIndex, startIdx } = run;
@@ -4804,9 +5029,32 @@ function emptyBoardClick() {
         rerender();
     }
 }
+let lastAutoFoundationAt = -Infinity;
+let lastAutoFoundationSourceKey = "";
+function autoFoundationSourceKey(src) {
+    if (!src) return "";
+    if (src.srcType === "tableau") return `tableau:${src.colIndex}:${src.cardIndex ?? src.startIndex ?? ""}`;
+    if (src.srcType === "column") return `column:${src.colIndex}:${src.startIndex ?? ""}`;
+    if (src.srcType === "waste") return "waste";
+    if (src.srcType === "freecell") return `freecell:${src.freecellIndex}`;
+    if (src.srcType === "foundation") return `foundation:${src.foundationIndex}`;
+    return JSON.stringify(src);
+}
 function autoToFoundationGeneric(src) {
     if (!session)
         return;
+    // 1回のダブルクリックから click系フォールバックと native dblclick の両方が発火しても
+    // HOME送りは1回だけにする。これが無いと、特にwaste等で後ろのカードまで送られることがある。
+    const now = performance.now();
+    const sourceKey = autoFoundationSourceKey(src);
+    if (sourceKey === lastAutoFoundationSourceKey && now - lastAutoFoundationAt < 220) {
+        log(`[AUTO ${ts()}] duplicate dblclick ignored src=${sourceKey}`);
+        return;
+    }
+    lastAutoFoundationSourceKey = sourceKey;
+    lastAutoFoundationAt = now;
+    lastClickSrc = null;
+    lastClickTime = 0;
     log(`[AUTO ${ts()}] request from src=${JSON.stringify(src)} mode=${session.mode}`);
     if (session.mode === "freecell") {
         tryMoveByRefsFreecell(src, { destType: "foundation" });
@@ -4917,16 +5165,36 @@ function freecellStateKey(state) {
 function klondikeCardKey(c) {
     return c ? `${c.suit}${c.rank}${c.faceUp ? "u" : "d"}` : "-";
 }
+function klondikeFoundationProgressKey(state) {
+    // KlondikeのHOMEは物理的な左右位置ではなくスートごとの進行だけを比較する。
+    // 例: ♥Aを一番左/右どちらの空HOMEへ置いても、サポート上は同じ状態。
+    const progress = { H: 0, D: 0, C: 0, S: 0 };
+    for (const pile of state.foundations || []) {
+        if (!pile || pile.length === 0) continue;
+        const top = pile[pile.length - 1];
+        const suit = String(top?.suit || "");
+        if (Object.prototype.hasOwnProperty.call(progress, suit)) {
+            progress[suit] = Math.max(progress[suit], Number(top.rank) || pile.length);
+        }
+    }
+    return [progress.H, progress.D, progress.C, progress.S].join(".");
+}
 function klondikeStateKey(state) {
     return state.stock.map(klondikeCardKey).join(".") + ">" +
         state.waste.map(klondikeCardKey).join(".") + "|" +
         state.tableaus.map(col => col.map(klondikeCardKey).join(".")).join("|") + ";" +
-        state.foundations.map(p => p.length).join(".");
+        klondikeFoundationProgressKey(state);
+}
+function spiderCardKey(c) { return c ? `${c.suit}${c.rank}${c.faceUp ? "u" : "d"}` : "-"; }
+function spiderStateKey(state) {
+    return `${Number(state.completedStacks || 0)};${(state.stock || []).map(spiderCardKey).join(".")};` +
+        (state.columns || []).map(col => col.map(spiderCardKey).join(".")).join("|");
 }
 function currentSupportStateKey(sess) {
     if (!sess) return "";
     if (sess.mode === "freecell") return freecellStateKey(sess.state);
     if (sess.mode === "klondike") return klondikeStateKey(sess.state);
+    if (sess.mode === "spider") return spiderStateKey(sess.state);
     return "";
 }
 function clearSupportRuntime() {
@@ -4965,6 +5233,70 @@ function normalizeKlondikeSupportMove(move) {
     to.index = Number(move.to.index);
     if (!Number.isInteger(to.index)) return null;
     return { kind: "move", from, to, cards: Array.isArray(move.cards) ? move.cards.map(String) : [] };
+}
+function normalizeSpiderSupportMove(move) {
+    if (!move || typeof move !== "object") return null;
+    if (move.kind === "deal") return { kind: "deal" };
+    if (move.kind !== "move" || !move.from || !move.to) return null;
+    if (String(move.from.type || "") !== "tableau" || String(move.to.type || "") !== "tableau") return null;
+    const fromIndex = Number(move.from.index), startIndex = Number(move.from.startIndex), toIndex = Number(move.to.index);
+    if (![fromIndex, startIndex, toIndex].every(Number.isInteger)) return null;
+    if (fromIndex < 0 || fromIndex > 9 || toIndex < 0 || toIndex > 9 || startIndex < 0) return null;
+    return { kind: "move", from: { type: "tableau", index: fromIndex, startIndex }, to: { type: "tableau", index: toIndex }, cards: Array.isArray(move.cards) ? move.cards.map(String) : [] };
+}
+function spiderRemoveCompletedRunsSync(state) {
+    while (true) {
+        let found = null;
+        for (let ci = 0; ci < state.columns.length; ci++) {
+            const col = state.columns[ci];
+            if (col.length < 13) continue;
+            const start = col.length - 13;
+            const suit = col[start].suit;
+            let ok = true;
+            for (let i = 0; i < 13; i++) {
+                const c = col[start + i];
+                if (!c.faceUp || c.suit !== suit || c.rank !== 13 - i) { ok = false; break; }
+            }
+            if (ok) { found = { ci, start }; break; }
+        }
+        if (!found) break;
+        const col = state.columns[found.ci];
+        col.splice(found.start, 13);
+        if (col.length && !col[col.length - 1].faceUp) col[col.length - 1].faceUp = true;
+        state.completedStacks = Number(state.completedStacks || 0) + 1;
+    }
+}
+function applySpiderSupportMoveState(state, move) {
+    const st = JSON.parse(JSON.stringify(state));
+    if (move.kind === "deal") {
+        if (!st.stock || st.stock.length < 10 || st.columns.some(col => col.length === 0)) return null;
+        for (let ci = 0; ci < 10; ci++) {
+            const c = st.stock.pop();
+            if (!c) return null;
+            c.faceUp = true;
+            st.columns[ci].push(c);
+        }
+        spiderRemoveCompletedRunsSync(st);
+        return st;
+    }
+    const from = st.columns[move.from.index], to = st.columns[move.to.index];
+    const start = move.from.startIndex;
+    if (!from || !to || start < 0 || start >= from.length) return null;
+    const first = from[start];
+    if (!first?.faceUp) return null;
+    for (let i = start; i < from.length - 1; i++) {
+        const a = from[i], b = from[i + 1];
+        if (!a.faceUp || !b.faceUp || a.suit !== b.suit || a.rank !== b.rank + 1) return null;
+    }
+    if (to.length) {
+        const top = to[to.length - 1];
+        if (!top.faceUp || first.rank !== top.rank - 1) return null;
+    }
+    const seq = from.splice(start);
+    to.push(...seq);
+    if (from.length && !from[from.length - 1].faceUp) from[from.length - 1].faceUp = true;
+    spiderRemoveCompletedRunsSync(st);
+    return st;
 }
 function prepareSupportRoute(sess, moves) {
     clearSupportRuntime();
@@ -5020,6 +5352,23 @@ function prepareSupportRoute(sess, moves) {
         supportMode = "klondike";
         supportRoute = normalizedMoves;
         supportRouteStateKeys = keys;
+    } else if (sess.mode === "spider") {
+        let state = JSON.parse(JSON.stringify(sess.state));
+        const keys = [spiderStateKey(state)];
+        const normalizedMoves = [];
+        for (const raw of moves) {
+            const m = normalizeSpiderSupportMove(raw);
+            if (!m) return false;
+            const next = applySpiderSupportMoveState(state, m);
+            if (!next) return false;
+            state = next;
+            normalizedMoves.push(m);
+            keys.push(spiderStateKey(state));
+        }
+        if (Number(state.completedStacks || 0) !== 8 || (state.stock || []).length || state.columns.some(col => col.length)) return false;
+        supportMode = "spider";
+        supportRoute = normalizedMoves;
+        supportRouteStateKeys = keys;
     } else {
         return false;
     }
@@ -5048,6 +5397,7 @@ function supportMoveLabel(move) {
         if (session?.mode === "klondike" && session.state.stock.length === 0 && session.state.waste.length > 0) return "山札をリサイクル";
         return "山札をめくる";
     }
+    if (move.kind === "deal") return "山札を10列へ配る";
     const cardId = move.cards?.[0] || "カード";
     const m = String(cardId).match(/^([HDCS])(\d+)#/);
     let cardText = cardId;
@@ -5061,6 +5411,29 @@ function supportMoveLabel(move) {
     };
     return `${cardText}: ${place(move.from)} → ${place(move.to)}`;
 }
+function klondikeSupportFoundationTargets(move) {
+    if (!session || session.mode !== "klondike" || !move || move.to?.type !== "foundation") return [];
+    const raw = String(move.cards?.[0] || "");
+    const m = raw.match(/^([HDCS])(\d+)#/);
+    if (!m) return Number.isInteger(move.to?.index) ? [move.to.index] : [];
+    const suit = m[1];
+    const rank = Number(m[2]);
+    const exact = [];
+    const empty = [];
+    const piles = session.state.foundations || [];
+    for (let i = 0; i < piles.length; i++) {
+        const pile = piles[i] || [];
+        if (pile.length === 0) {
+            if (rank === 1) empty.push(i);
+            continue;
+        }
+        const top = pile[pile.length - 1];
+        if (top.suit === suit && Number(top.rank) + 1 === rank) exact.push(i);
+    }
+    if (exact.length) return exact;
+    if (empty.length) return empty;
+    return Number.isInteger(move.to?.index) ? [move.to.index] : [];
+}
 function applySupportHintDom() {
     document.querySelectorAll(".support-hint-source,.support-hint-dest,.support-hint-dest-card").forEach(el => el.classList.remove("support-hint-source", "support-hint-dest", "support-hint-dest-card"));
     if (!supportHintVisible || !supportRoute || supportOffRoute || supportRouteIndex >= supportRoute.length || !session || supportMode !== session.mode) return;
@@ -5070,9 +5443,44 @@ function applySupportHintDom() {
         if (stock) stock.classList.add("support-hint-source");
         return;
     }
+    if (session.mode === "spider" && move.kind === "deal") {
+        const stock = document.querySelector('[data-spider-stock="1"]');
+        if (stock) stock.classList.add("support-hint-source");
+        return;
+    }
+    if (session.mode === "spider" && move.kind === "move") {
+        const src = document.querySelector(`[data-spider-col="${move.from.index}"][data-spider-index="${move.from.startIndex}"]`);
+        if (src) src.classList.add("support-hint-source");
+        const dest = document.querySelector(`[data-drop="tableau-${move.to.index}"]`);
+        if (dest) dest.classList.add("support-hint-dest");
+        const col = session.state.columns?.[move.to.index] || [];
+        const topIndex = col.length - 1;
+        if (topIndex >= 0) {
+            const top = document.querySelector(`[data-spider-col="${move.to.index}"][data-spider-index="${topIndex}"]`);
+            if (top) top.classList.add("support-hint-dest-card");
+        }
+        return;
+    }
     for (const id of move.cards || []) {
         const el = document.querySelector(`[data-card-id="${CSS.escape(id)}"]`);
         if (el) el.classList.add("support-hint-source");
+    }
+    // KlondikeのHOMEは左右位置を固定しない。Aなら置ける空HOMEすべて、
+    // 2以降なら現在そのスートが積まれているHOMEを強調する。
+    if (session.mode === "klondike" && move.to.type === "foundation") {
+        const targets = klondikeSupportFoundationTargets(move);
+        for (const idx of targets) {
+            const dest = document.querySelector(`[data-drop="foundation-${idx}"]`);
+            if (dest) dest.classList.add("support-hint-dest");
+            const pile = session.state.foundations?.[idx] || [];
+            const destCard = pile.length ? pile[pile.length - 1] : null;
+            if (destCard) {
+                const id = destCard.id || `${destCard.suit}${destCard.rank}#0`;
+                const cardEl = document.querySelector(`[data-card-id="${CSS.escape(id)}"]`);
+                if (cardEl) cardEl.classList.add("support-hint-dest-card");
+            }
+        }
+        return;
     }
     let destName = "";
     if (session.mode === "freecell") {
@@ -5097,9 +5505,6 @@ function applySupportHintDom() {
         if (move.to.type === "tableau") {
             const col = session.state.tableaus?.[move.to.index] || [];
             destCard = col.length ? col[col.length - 1] : null;
-        } else if (move.to.type === "foundation") {
-            const pile = session.state.foundations?.[move.to.index] || [];
-            destCard = pile.length ? pile[pile.length - 1] : null;
         }
     }
     if (destCard) {
@@ -5195,7 +5600,23 @@ async function resolveSupportedFreeCell(level) {
     startBusy = true;
     try {
         const dealV = (0, dealVersion_1.getDealVersion)("freecell");
-        // まず既存のクリア保証seedを1件解析する。既にローカル解析済みなら即開始できる。
+        // まず事前解析済みルートを取得。あればゲーム開始時の解析は不要。
+        menuNetworkStatus = "解析済みフリーセルseedを取得中...";
+        if (screen === "menu") rerender();
+        try {
+            const solvedServer = await (0, clearSeedApi_1.fetchSolvedRoute)("freecell", level, dealV);
+            if (solvedServer) {
+                const temp = new session_1.GameSession("freecell", level, solvedServer.seed >>> 0);
+                if (prepareSupportRoute(temp, solvedServer.moves)) {
+                    const verified = supportRoute.slice(); clearSupportRuntime();
+                    saveSolutionCache(level, solvedServer.seed, dealV, verified);
+                    menuNetworkStatus = `解析済みseedから開始（登録済み ${solvedServer.count}件）`;
+                    return { seed: solvedServer.seed >>> 0, source: "guaranteed", supportMoves: verified };
+                }
+                clearSupportRuntime();
+            }
+        } catch (err) { log(`[F-SUPPORT ${ts()}] solved route fetch failed`, err); }
+        // 解析済みプールが空なら既存クリアseedを解析する。
         menuNetworkStatus = "サポート用クリアルートを解析中...";
         if (screen === "menu") rerender();
         try {
@@ -5213,8 +5634,10 @@ async function resolveSupportedFreeCell(level) {
             const solved = await solveFreeCellSeed(level, seed);
             if (!solved) continue;
             // ソルバーで完走確認できたseedは通常のクリア保証共有庫にも登録する。
-            try { await (0, clearSeedApi_1.registerVerifiedSeed)("freecell", level, seed, solved.dealVersion, solved.moves.length); }
-            catch (err) { log(`[SUPPORT ${ts()}] verified seed upload failed`, err); }
+            try {
+                await (0, clearSeedApi_1.registerVerifiedSeed)("freecell", level, seed, solved.dealVersion, solved.moves.length);
+                await (0, clearSeedApi_1.registerSolvedRoute)("freecell", level, seed, solved.dealVersion, solved.moves, FREECELL_SOLVER_VERSION, false);
+            } catch (err) { log(`[SUPPORT ${ts()}] verified seed upload failed`, err); }
             return { seed, source: "guaranteed", supportMoves: solved.moves };
         }
         menuNetworkStatus = "この条件ではクリアルートを見つけられませんでした。もう一度お試しください";
@@ -5315,12 +5738,86 @@ async function resolveSupportedKlondike(level) {
     }
 }
 
+function loadSpiderSolutionCache(level, seed, dealVersion) {
+    try {
+        const all = JSON.parse(localStorage.getItem(SPIDER_SOLUTION_CACHE_KEY) || "[]");
+        const found = Array.isArray(all) ? all.find(x => x && x.level === level && (x.seed >>> 0) === (seed >>> 0) && x.dealVersion === dealVersion) : null;
+        return found && Array.isArray(found.moves) ? found.moves : null;
+    } catch { return null; }
+}
+function saveSpiderSolutionCache(level, seed, dealVersion, moves) {
+    try {
+        if (!Array.isArray(moves) || !moves.length) return;
+        let all = JSON.parse(localStorage.getItem(SPIDER_SOLUTION_CACHE_KEY) || "[]");
+        if (!Array.isArray(all)) all = [];
+        const old = all.find(x => x && x.level === level && (x.seed >>> 0) === (seed >>> 0) && x.dealVersion === dealVersion);
+        if (old && Array.isArray(old.moves) && old.moves.length <= moves.length) return;
+        all = all.filter(x => !(x && x.level === level && (x.seed >>> 0) === (seed >>> 0) && x.dealVersion === dealVersion));
+        all.unshift({ level, seed: seed >>> 0, dealVersion, moves, savedAt: Date.now() });
+        if (all.length > 12) all.length = 12;
+        localStorage.setItem(SPIDER_SOLUTION_CACHE_KEY, JSON.stringify(all));
+    } catch {}
+}
+async function solveSpiderSeed(level, seed, options = {}) {
+    const temp = new session_1.GameSession("spider", level, seed >>> 0);
+    const cached = loadSpiderSolutionCache(level, seed, temp.dealVersion);
+    if (cached?.length) {
+        if (prepareSupportRoute(temp, cached)) {
+            const verified = supportRoute.slice(); clearSupportRuntime();
+            return { moves: verified, dealVersion: temp.dealVersion, cached: true, optimal: false };
+        }
+        clearSupportRuntime();
+    }
+    const defaults = level === 1
+        ? { maxMs: 12000, maxNodes: 2200000, beamWidth: 1200 }
+        : level === 2
+            ? { maxMs: 30000, maxNodes: 3500000, beamWidth: 1400 }
+            : { maxMs: 45000, maxNodes: 4800000, beamWidth: 1600 };
+    const result = await (0, spiderSolver_1.solveSpiderState)(temp.state, { ...defaults, ...options });
+    if (!result?.ok || !Array.isArray(result.moves) || !result.moves.length) return null;
+    if (!prepareSupportRoute(temp, result.moves)) { clearSupportRuntime(); return null; }
+    const verifiedMoves = supportRoute.slice();
+    clearSupportRuntime();
+    saveSpiderSolutionCache(level, seed, temp.dealVersion, verifiedMoves);
+    return { moves: verifiedMoves, dealVersion: temp.dealVersion, cached: false, optimal: false };
+}
+async function resolveSupportedSpider(level) {
+    startBusy = true;
+    try {
+        const dealV = (0, dealVersion_1.getDealVersion)("spider");
+        menuNetworkStatus = "解析済みスパイダーseedを取得中...";
+        if (screen === "menu") rerender();
+        try {
+            const solvedServer = await (0, clearSeedApi_1.fetchSolvedRoute)("spider", level, dealV);
+            if (solvedServer) {
+                const temp = new session_1.GameSession("spider", level, solvedServer.seed >>> 0);
+                if (prepareSupportRoute(temp, solvedServer.moves)) {
+                    const verified = supportRoute.slice(); clearSupportRuntime();
+                    saveSpiderSolutionCache(level, solvedServer.seed, dealV, verified);
+                    menuNetworkStatus = `解析済みseedから開始（登録済み ${solvedServer.count}件）`;
+                    return { seed: solvedServer.seed >>> 0, source: "guaranteed", supportMoves: verified };
+                }
+                clearSupportRuntime();
+            }
+        } catch (err) { log(`[S-SUPPORT ${ts()}] solved route fetch failed`, err); }
+        // Spiderは開始時解析が重いため、プールが空なら待たせず管理ツールでの事前生成を案内する。
+        menuNetworkStatus = `スパイダーLv${level}の解析済みseedがありません。?solvetools=1 で事前生成してください`;
+        return null;
+    } finally {
+        startBusy = false;
+        if (screen === "menu") rerender();
+    }
+}
+
 async function resolveSeedForStart(mode, level) {
     if (mode === "freecell" && clearGuaranteeEnabled && freecellSupportEnabled) {
         return await resolveSupportedFreeCell(level);
     }
     if (mode === "klondike" && clearGuaranteeEnabled && klondikeSupportEnabled) {
         return await resolveSupportedKlondike(level);
+    }
+    if (mode === "spider" && clearGuaranteeEnabled && spiderSupportEnabled) {
+        return await resolveSupportedSpider(level);
     }
     if (!clearGuaranteeEnabled) {
         return {
@@ -5371,7 +5868,7 @@ function beginSession(mode, level, seed, source, logKind, supportMoves = null) {
     }
     session = new session_1.GameSession(mode, level, seed >>> 0);
     clearSupportRuntime();
-    const supportWanted = (mode === "freecell" && freecellSupportEnabled) || (mode === "klondike" && klondikeSupportEnabled);
+    const supportWanted = (mode === "freecell" && freecellSupportEnabled) || (mode === "klondike" && klondikeSupportEnabled) || (mode === "spider" && spiderSupportEnabled);
     if (supportWanted && Array.isArray(supportMoves) && supportMoves.length) {
         if (prepareSupportRoute(session, supportMoves)) {
             log(`[SUPPORT ${ts()}] ${mode} route ready ${supportRoute.length} moves`);
@@ -5816,53 +6313,78 @@ const dnd = (0, dndCore_1.createDnD)({
 // 画面描画
 // -------------------------------------------------
 
-let solverToolsCounts = [null, null, null];
+let solverToolsCounts = {
+    freecell: [null, null, null],
+    klondike: [null, null, null],
+    spider: [null, null, null],
+};
 let solverToolsCountsLoading = false;
 async function refreshSolverToolsCounts() {
     if (solverToolsCountsLoading) return;
     solverToolsCountsLoading = true;
     try {
-        const dealV = (0, dealVersion_1.getDealVersion)("klondike");
-        const vals = [];
-        for (let level = 1; level <= 3; level++) {
-            try { vals.push(await (0, clearSeedApi_1.fetchSolvedRouteStats)("klondike", level, dealV)); }
-            catch { vals.push(null); }
+        for (const mode of ["freecell", "klondike", "spider"]) {
+            const dealV = (0, dealVersion_1.getDealVersion)(mode);
+            const vals = [];
+            for (let level = 1; level <= 3; level++) {
+                try { vals.push(await (0, clearSeedApi_1.fetchSolvedRouteStats)(mode, level, dealV)); }
+                catch { vals.push(null); }
+            }
+            solverToolsCounts[mode] = vals;
         }
-        solverToolsCounts = vals;
     } finally {
         solverToolsCountsLoading = false;
         if (screen === "menu" && solverToolsVisible) rerender();
     }
 }
-async function runKlondikePregeneration(level, targetCount) {
+async function solveSeedForTool(mode, level, seed) {
+    if (mode === "freecell") return await solveFreeCellSeed(level, seed);
+    if (mode === "klondike") return await solveKlondikeSeed(level, seed, { maxMs: level >= 3 ? 4500 : 3200, maxNodes: level >= 3 ? 500000 : 360000 });
+    return await solveSpiderSeed(level, seed, level === 1
+        ? { maxMs: 12000, maxNodes: 2200000, beamWidth: 1200 }
+        : level === 2
+            ? { maxMs: 30000, maxNodes: 3500000, beamWidth: 1400 }
+            : { maxMs: 45000, maxNodes: 4800000, beamWidth: 1600 });
+}
+function solverVersionForMode(mode) {
+    if (mode === "freecell") return FREECELL_SOLVER_VERSION;
+    if (mode === "klondike") return KLONDIKE_SOLVER_VERSION;
+    return SPIDER_SOLVER_VERSION;
+}
+async function runSolvedSeedPregeneration(mode, level, targetCount) {
     if (solverToolsBusy) return;
     solverToolsBusy = true;
     solverToolsStopRequested = false;
     const wanted = Math.max(1, Math.min(100, Number(targetCount) | 0));
-    let solvedCount = 0, attempts = 0;
+    const maxAttempts = wanted * (mode === "spider" ? (level === 1 ? 80 : level === 2 ? 160 : 260) : 25);
+    let solvedCount = 0, attempts = 0, unresolved = 0;
+    const label = mode === "freecell" ? "フリーセル" : mode === "klondike" ? "クロンダイク" : "スパイダー";
     try {
-        const dealV = (0, dealVersion_1.getDealVersion)("klondike");
-        while (!solverToolsStopRequested && solvedCount < wanted && attempts < wanted * 25) {
+        const dealV = (0, dealVersion_1.getDealVersion)(mode);
+        while (!solverToolsStopRequested && solvedCount < wanted && attempts < maxAttempts) {
             attempts++;
             const seed = Math.floor(Math.random() * 2 ** 32) >>> 0;
-            solverToolsStatus = `Lv${level}: ${solvedCount}/${wanted}件　解析 ${attempts}回目　seed ${seed}`;
+            solverToolsStatus = `${label} Lv${level}: ${solvedCount}/${wanted}件　解析 ${attempts}/${maxAttempts}　未解決 ${unresolved}　seed ${seed}`;
             if (screen === "menu") rerender();
-            const solved = await solveKlondikeSeed(level, seed, { maxMs: level >= 3 ? 4500 : 3200, maxNodes: level >= 3 ? 500000 : 360000 });
-            if (!solved) continue;
+            const solved = await solveSeedForTool(mode, level, seed);
+            if (!solved) { unresolved++; continue; }
             try {
-                await (0, clearSeedApi_1.registerSolvedRoute)("klondike", level, seed, dealV, solved.moves, KLONDIKE_SOLVER_VERSION, !!solved.optimal);
+                await (0, clearSeedApi_1.registerSolvedRoute)(mode, level, seed, dealV, solved.moves, solverVersionForMode(mode), !!solved.optimal);
+                // 解析済みルートは通常のクリア保証seed共有庫にも入れておく。
+                try { await (0, clearSeedApi_1.registerVerifiedSeed)(mode, level, seed, dealV, solved.moves.length); } catch {}
                 solvedCount++;
-                solverToolsStatus = `Lv${level}: ${solvedCount}/${wanted}件を登録済み（試行 ${attempts}）`;
-                solverToolsCounts[level - 1] = (solverToolsCounts[level - 1] ?? 0) + 1;
+                const cur = solverToolsCounts[mode]?.[level - 1];
+                if (Number.isInteger(cur)) solverToolsCounts[mode][level - 1] = cur + 1;
+                solverToolsStatus = `${label} Lv${level}: ${solvedCount}/${wanted}件登録済み（試行 ${attempts} / 未解決 ${unresolved}）`;
                 if (screen === "menu") rerender();
             } catch (err) {
                 solverToolsStatus = `サーバー登録失敗: ${String(err?.message || err)}`;
                 break;
             }
         }
-        if (solverToolsStopRequested) solverToolsStatus = `停止しました。Lv${level} ${solvedCount}件生成`;
-        else if (solvedCount >= wanted) solverToolsStatus = `完了: Lv${level} ${solvedCount}件を事前生成しました`;
-        else solverToolsStatus = `終了: Lv${level} ${solvedCount}件 / ${wanted}件（探索上限）`;
+        if (solverToolsStopRequested) solverToolsStatus = `停止しました。${label} Lv${level} ${solvedCount}件生成`;
+        else if (solvedCount >= wanted) solverToolsStatus = `完了: ${label} Lv${level} ${solvedCount}件を事前生成しました（未解決 ${unresolved}）`;
+        else solverToolsStatus = `終了: ${label} Lv${level} ${solvedCount}/${wanted}件（試行上限 / 未解決 ${unresolved}）`;
         await refreshSolverToolsCounts();
     } finally {
         solverToolsBusy = false;
@@ -5872,43 +6394,61 @@ async function runKlondikePregeneration(level, targetCount) {
 function renderSolverToolsPanel(rootEl) {
     if (!solverToolsVisible || screen !== "menu") return;
     const panel = document.createElement("div");
-    panel.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:9000;width:min(430px,calc(100vw - 32px));background:#151515;border:1px solid #666;border-radius:10px;padding:14px;color:#fff;box-shadow:0 10px 35px #000a;font-family:sans-serif";
+    panel.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:9000;width:min(520px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;background:#151515;border:1px solid #666;border-radius:10px;padding:14px;color:#fff;box-shadow:0 10px 35px #000a;font-family:sans-serif";
     const title = document.createElement("div");
-    title.textContent = "クロンダイク解析seed 事前生成ツール";
+    title.textContent = "解析seed 事前生成ツール";
     title.style.cssText = "font-weight:900;font-size:16px;margin-bottom:8px";
     panel.appendChild(title);
-    const counts = document.createElement("div");
-    counts.style.cssText = "font-size:12px;color:#bbb;margin-bottom:10px";
-    counts.textContent = `サーバー: Lv1 ${solverToolsCounts[0] ?? "?"}件 / Lv2 ${solverToolsCounts[1] ?? "?"}件 / Lv3 ${solverToolsCounts[2] ?? "?"}件`;
-    panel.appendChild(counts);
+    const labels = { freecell: "フリーセル", klondike: "クロンダイク", spider: "スパイダー" };
+    const countBox = document.createElement("div");
+    countBox.style.cssText = "font-size:12px;color:#bbb;margin-bottom:10px;line-height:1.65";
+    countBox.innerHTML = ["freecell","klondike","spider"].map(mode => {
+        const v = solverToolsCounts[mode] || [null,null,null];
+        return `${labels[mode]}　Lv1 ${v[0] ?? "?"} / Lv2 ${v[1] ?? "?"} / Lv3 ${v[2] ?? "?"}`;
+    }).join("<br>");
+    panel.appendChild(countBox);
     const row = document.createElement("div");
     row.style.cssText = "display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+    const modeSel = document.createElement("select");
+    modeSel.id = "solver-tool-mode";
+    modeSel.innerHTML = '<option value="freecell">フリーセル</option><option value="klondike">クロンダイク</option><option value="spider">スパイダー</option>';
+    modeSel.value = solverToolsSelectedMode;
+    modeSel.disabled = solverToolsBusy;
+    modeSel.addEventListener("change", () => { solverToolsSelectedMode = String(modeSel.value); });
     const levelSel = document.createElement("select");
     levelSel.id = "solver-tool-level";
     levelSel.innerHTML = '<option value="1">Lv1</option><option value="2">Lv2</option><option value="3">Lv3</option>';
+    levelSel.value = String(solverToolsSelectedLevel);
     levelSel.disabled = solverToolsBusy;
+    levelSel.addEventListener("change", () => { solverToolsSelectedLevel = Number(levelSel.value) || 1; });
     const countInput = document.createElement("input");
-    countInput.id = "solver-tool-count"; countInput.type = "number"; countInput.min = "1"; countInput.max = "100"; countInput.value = "10";
+    countInput.id = "solver-tool-count"; countInput.type = "number"; countInput.min = "1"; countInput.max = "100"; countInput.value = String(solverToolsTargetCount);
     countInput.style.width = "70px"; countInput.disabled = solverToolsBusy;
-    const start = document.createElement("button");
-    start.textContent = solverToolsBusy ? "解析中..." : "生成開始"; start.disabled = solverToolsBusy;
-    start.addEventListener("click", () => void runKlondikePregeneration(Number(levelSel.value), Number(countInput.value)));
+    countInput.addEventListener("change", () => { solverToolsTargetCount = Math.max(1, Math.min(100, Number(countInput.value) || 10)); });
+    const startBtn = document.createElement("button");
+    startBtn.textContent = solverToolsBusy ? "解析中..." : "生成開始"; startBtn.disabled = solverToolsBusy;
+    startBtn.addEventListener("click", () => {
+        solverToolsSelectedMode = String(modeSel.value);
+        solverToolsSelectedLevel = Number(levelSel.value) || 1;
+        solverToolsTargetCount = Math.max(1, Math.min(100, Number(countInput.value) || 10));
+        void runSolvedSeedPregeneration(solverToolsSelectedMode, solverToolsSelectedLevel, solverToolsTargetCount);
+    });
     const stop = document.createElement("button");
     stop.textContent = "停止"; stop.disabled = !solverToolsBusy;
     stop.addEventListener("click", () => { solverToolsStopRequested = true; solverToolsStatus = "停止要求を受け付けました..."; rerender(); });
     const refresh = document.createElement("button");
     refresh.textContent = "件数更新"; refresh.disabled = solverToolsBusy || solverToolsCountsLoading;
     refresh.addEventListener("click", () => void refreshSolverToolsCounts());
-    row.append(levelSel, countInput, start, stop, refresh); panel.appendChild(row);
+    row.append(modeSel, levelSel, countInput, startBtn, stop, refresh); panel.appendChild(row);
     const note = document.createElement("div");
     note.style.cssText = "font-size:11px;color:#aaa;margin-top:8px;line-height:1.5";
-    note.textContent = "ブラウザ内のWeb Workerで解析します。見つかった解法だけCloudflareへ保存し、通常のゲーム開始時は解析せず即取得できます。";
+    note.textContent = "Web Workerで解析し、実際に完走検証できたseed+ルートだけCloudflareへ保存します。SpiderはLv2/Lv3ほど重く、未解決seedは捨てて次を試します。";
     panel.appendChild(note);
     if (solverToolsStatus) {
         const st = document.createElement("div"); st.style.cssText = "font-size:12px;color:#8dffba;margin-top:8px;white-space:pre-wrap"; st.textContent = solverToolsStatus; panel.appendChild(st);
     }
     rootEl.appendChild(panel);
-    if (solverToolsCounts.every(v => v == null) && !solverToolsCountsLoading) setTimeout(() => void refreshSolverToolsCounts(), 0);
+    if (["freecell","klondike","spider"].every(m => (solverToolsCounts[m] || []).every(v => v == null)) && !solverToolsCountsLoading) setTimeout(() => void refreshSolverToolsCounts(), 0);
 }
 
 function rerender() {
@@ -5923,7 +6463,7 @@ function rerender() {
         ensureMenuStatsLoaded();
         (0, renderMenuScreen_1.renderMenuScreen)(rootEl, pendingMode, {
             guaranteeEnabled: clearGuaranteeEnabled,
-            supportEnabled: pendingMode === "klondike" ? klondikeSupportEnabled : freecellSupportEnabled,
+            supportEnabled: pendingMode === "klondike" ? klondikeSupportEnabled : pendingMode === "spider" ? spiderSupportEnabled : freecellSupportEnabled,
             pendingSeedCount: (0, clearSeedApi_1.pendingClearSeedCount)(),
             statusText: menuNetworkStatus,
             startBusy,
@@ -5947,6 +6487,7 @@ function rerender() {
                 if (!clearGuaranteeEnabled) {
                     if (freecellSupportEnabled) { freecellSupportEnabled = false; saveFreeCellSupportEnabled(false); }
                     if (klondikeSupportEnabled) { klondikeSupportEnabled = false; saveKlondikeSupportEnabled(false); }
+                    if (spiderSupportEnabled) { spiderSupportEnabled = false; saveSpiderSupportEnabled(false); }
                 }
                 (0, clearGuaranteeSetting_1.saveClearGuaranteeEnabled)(clearGuaranteeEnabled);
                 menuNetworkStatus = clearGuaranteeEnabled
@@ -5958,23 +6499,18 @@ function rerender() {
                 if (pendingMode === "klondike") {
                     klondikeSupportEnabled = !klondikeSupportEnabled;
                     saveKlondikeSupportEnabled(klondikeSupportEnabled);
-                    if (klondikeSupportEnabled && !clearGuaranteeEnabled) {
-                        clearGuaranteeEnabled = true;
-                        (0, clearGuaranteeSetting_1.saveClearGuaranteeEnabled)(true);
-                    }
-                    menuNetworkStatus = klondikeSupportEnabled
-                        ? "クロンダイクサポートをONにしました"
-                        : "クロンダイクサポートをOFFにしました";
+                    if (klondikeSupportEnabled && !clearGuaranteeEnabled) { clearGuaranteeEnabled = true; (0, clearGuaranteeSetting_1.saveClearGuaranteeEnabled)(true); }
+                    menuNetworkStatus = klondikeSupportEnabled ? "クロンダイクサポートをONにしました" : "クロンダイクサポートをOFFにしました";
+                } else if (pendingMode === "spider") {
+                    spiderSupportEnabled = !spiderSupportEnabled;
+                    saveSpiderSupportEnabled(spiderSupportEnabled);
+                    if (spiderSupportEnabled && !clearGuaranteeEnabled) { clearGuaranteeEnabled = true; (0, clearGuaranteeSetting_1.saveClearGuaranteeEnabled)(true); }
+                    menuNetworkStatus = spiderSupportEnabled ? "スパイダーサポートをONにしました" : "スパイダーサポートをOFFにしました";
                 } else {
                     freecellSupportEnabled = !freecellSupportEnabled;
                     saveFreeCellSupportEnabled(freecellSupportEnabled);
-                    if (freecellSupportEnabled && !clearGuaranteeEnabled) {
-                        clearGuaranteeEnabled = true;
-                        (0, clearGuaranteeSetting_1.saveClearGuaranteeEnabled)(true);
-                    }
-                    menuNetworkStatus = freecellSupportEnabled
-                        ? "FreeCellサポートをONにしました"
-                        : "FreeCellサポートをOFFにしました";
+                    if (freecellSupportEnabled && !clearGuaranteeEnabled) { clearGuaranteeEnabled = true; (0, clearGuaranteeSetting_1.saveClearGuaranteeEnabled)(true); }
+                    menuNetworkStatus = freecellSupportEnabled ? "フリーセルサポートをONにしました" : "フリーセルサポートをOFFにしました";
                 }
                 rerender();
             },
@@ -6221,9 +6757,14 @@ function rerender() {
             return;
         }
         if (session.mode === "spider") {
+            const animObjSP = window.spiderAnim;
             const stSP = session.state;
+            // 完成K-Aの自動回収直前/回収中は、ソルバー側では既に回収済み状態として扱うため
+            // 一時的にルート外判定しない。回収終了後に同期する。
+            if (!animObjSP?.active && !spiderFindCompleteRun(stSP)) syncSupportPosition();
             const highlightMap = buildSpiderHighlightMap(stSP, uiState.selectedFrom);
-            (0, renderSpiderScreen_1.renderSpiderScreen)(rootEl, session, uiState, highlightMap, gameCleared, {
+            const supportUiS = { ...uiState, supportEnabled: !!supportRoute && supportMode === "spider", supportStep: supportRouteIndex, supportTotal: supportRoute?.length || 0, supportOffRoute };
+            (0, renderSpiderScreen_1.renderSpiderScreen)(rootEl, session, supportUiS, highlightMap, gameCleared, {
                 onBackToMenu: () => backToMenu(),
                 onUndoClick: () => undoOneMove(),
                 onNewGameClick: () => openNewGameMenu(),
@@ -6240,8 +6781,10 @@ function rerender() {
                 // 事前選択・アウトライン表示なしでそのまま掴んで移動できる。
                 onDragStart: (srcRef, ev) => dnd.startDrag(srcRef, ev),
                 onStockClick: () => spiderDealFromStockOnce(),
+                onSupportHintClick: () => onSupportHintClick(),
                 onEmptyBoardClick: () => emptyBoardClick(),
             });
+            setTimeout(() => applySupportHintDom(), 0);
             afterRenderScale();
             return;
         }
@@ -8316,7 +8859,7 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
         : "通常のランダムseedで開始します";
     guaranteeWrap.appendChild(guaranteeDesc);
     screen.appendChild(guaranteeWrap);
-    if (pendingMode === "freecell" || pendingMode === "klondike") {
+    if (pendingMode === "freecell" || pendingMode === "klondike" || pendingMode === "spider") {
         const supportWrap = document.createElement("div");
         supportWrap.className = "guarantee-wrap";
         const supportBtn = document.createElement("button");
@@ -8328,12 +8871,16 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
         const supportDesc = document.createElement("div");
         supportDesc.className = "support-desc";
         supportDesc.textContent = opts.supportEnabled
-            ? (pendingMode === "klondike"
-                ? "事前解析済みseedを優先し、次の一手を常時案内します"
-                : "解法を実際に検証したseedで開始し、次の一手を常時案内します")
-            : (pendingMode === "klondike"
-                ? "ONにするとクリア保証もONになり、解析済みクロンダイクseedを使います"
-                : "ONにするとクリア保証もONになり、FreeCellのクリアルートを解析します");
+            ? (pendingMode === "spider"
+                ? "事前解析済みSpider seedを使い、次の一手を常時案内します"
+                : pendingMode === "klondike"
+                    ? "事前解析済みseedを優先し、次の一手を常時案内します"
+                    : "解析済みseedを優先し、次の一手を常時案内します")
+            : (pendingMode === "spider"
+                ? "ONにするとクリア保証もONになり、事前生成済みSpider seedを使います"
+                : pendingMode === "klondike"
+                    ? "ONにするとクリア保証もONになり、解析済みクロンダイクseedを使います"
+                    : "ONにするとクリア保証もONになり、解析済みFreeCell seedを優先します");
         supportWrap.appendChild(supportDesc);
         screen.appendChild(supportWrap);
     }
@@ -8415,10 +8962,15 @@ function renderSpiderScreen(rootEl, session, uiState, highlightMap, gameCleared,
         readyForFinish: false,
         finishing: false,
         gameCleared: gameCleared || uiState.cleared,
+        supportEnabled: !!uiState.supportEnabled,
+        supportStep: uiState.supportStep || 0,
+        supportTotal: uiState.supportTotal || 0,
+        supportOffRoute: !!uiState.supportOffRoute,
     }, {
         onBackToMenu: () => handlers.onBackToMenu(),
         onNewGameClick: () => handlers.onNewGameClick(),
         onUndoClick: () => handlers.onUndoClick(),
+        onSupportHintClick: () => handlers.onSupportHintClick?.(),
         // onFinishClick は渡さない
     });
     // トップバーは frame 内（board と同幅）
@@ -8443,6 +8995,7 @@ function renderSpiderScreen(rootEl, session, uiState, highlightMap, gameCleared,
         stockSlot.dataset.drop = "";
         stockSlot.style.position = "relative";
         stockSlot.style.cursor = "pointer";
+        stockSlot.dataset.spiderStock = "1";
         // 残り何回配れるか（stock.length / 10）
         if (st.stock && st.stock.length > 0) {
             const remainingDeals = Math.floor(st.stock.length / 10);
@@ -8528,6 +9081,8 @@ function renderSpiderScreen(rootEl, session, uiState, highlightMap, gameCleared,
             cardEl.style.position = "absolute";
             cardEl.style.top = currentTop + "px";
             cardEl.style.left = "0px";
+            cardEl.dataset.spiderCol = String(colIndex);
+            cardEl.dataset.spiderIndex = String(cardIndex);
             // この位置がドラッグ可能ヘッドか判定（同スート降順で末尾まで続く）
             const canDragHead = faceUp && isSpiderMovableHead(col, cardIndex);
             if (faceUp && canDragHead) {
