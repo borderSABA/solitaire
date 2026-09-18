@@ -1185,7 +1185,7 @@ body {
 </head>
 <body>
 <div id="felt-wrapper"><div id="game-scale-wrapper"><div id="app"></div></div></div>
-<div id="version-badge" class="version-badge" aria-label="version">v1.5.4</div>
+<div id="version-badge" class="version-badge" aria-label="version">v1.5.5</div>
 <script>
 (function(){
 "use strict";
@@ -3667,6 +3667,31 @@ const FREECELL_SOLVER_VERSION = 1;
 const SPIDER_SUPPORT_KEY = "SolitaireSpiderSupportV1";
 const SPIDER_SOLUTION_CACHE_KEY = "SolitaireSpiderSolutionCacheV1";
 const SPIDER_SOLVER_VERSION = 2;
+const SOLUTION_CACHE_CURSOR_PREFIX = "SolitaireSolutionCacheCursorV1";
+function readSolutionCacheEntries(cacheKey, level, dealVersion) {
+    try {
+        const all = JSON.parse(localStorage.getItem(cacheKey) || "[]");
+        return Array.isArray(all) ? all.filter(x => x && x.level === level && x.dealVersion === dealVersion && Number.isInteger(Number(x.seed)) && Array.isArray(x.moves) && x.moves.length) : [];
+    } catch { return []; }
+}
+function pickCachedSolution(cacheKey, mode, level, dealVersion) {
+    const list = readSolutionCacheEntries(cacheKey, level, dealVersion);
+    if (!list.length) return null;
+    try {
+        const key = `${SOLUTION_CACHE_CURSOR_PREFIX}_${mode}_L${level}_D${dealVersion}`;
+        let idx = Number(localStorage.getItem(key) || 0) | 0;
+        if (idx < 0) idx = 0;
+        const picked = list[idx % list.length];
+        localStorage.setItem(key, String((idx + 1) % Math.max(1, list.length)));
+        return picked;
+    } catch { return list[0]; }
+}
+function cachedSolutionForMode(mode, level, dealVersion) {
+    if (mode === "freecell") return pickCachedSolution(FREECELL_SOLUTION_CACHE_KEY, mode, level, dealVersion);
+    if (mode === "klondike") return pickCachedSolution(KLONDIKE_SOLUTION_CACHE_KEY, mode, level, dealVersion);
+    if (mode === "spider") return pickCachedSolution(SPIDER_SOLUTION_CACHE_KEY, mode, level, dealVersion);
+    return null;
+}
 function loadFreeCellSupportEnabled() { try { return localStorage.getItem(FREECELL_SUPPORT_KEY) === "1"; } catch { return false; } }
 function saveFreeCellSupportEnabled(v) { try { localStorage.setItem(FREECELL_SUPPORT_KEY, v ? "1" : "0"); } catch {} }
 function loadKlondikeSupportEnabled() { try { return localStorage.getItem(KLONDIKE_SUPPORT_KEY) === "1"; } catch { return false; } }
@@ -5939,7 +5964,18 @@ async function resolveSupportedFreeCell(level) {
     startBusy = true;
     try {
         const dealV = (0, dealVersion_1.getDealVersion)("freecell");
-        // まず事前解析済みルートを取得。あればゲーム開始時の解析は不要。
+        // 端末に一度保存した解析済みルートを最優先。Cloudflareへの再問い合わせを避ける。
+        const localCached = cachedSolutionForMode("freecell", level, dealV);
+        if (localCached) {
+            const temp = new session_1.GameSession("freecell", level, Number(localCached.seed) >>> 0);
+            if (prepareSupportRoute(temp, localCached.moves)) {
+                const verified = supportRoute.slice(); clearSupportRuntime();
+                menuNetworkStatus = `端末キャッシュから開始（${verified.length}手）`;
+                return { seed: Number(localCached.seed) >>> 0, source: "guaranteed", supportMoves: verified };
+            }
+            clearSupportRuntime();
+        }
+        // 端末に無い時だけ事前解析済みルートをCloudflareから1件取得。
         menuNetworkStatus = "解析済みフリーセルseedを取得中...";
         if (screen === "menu") rerender();
         try {
@@ -5967,14 +6003,13 @@ async function resolveSupportedFreeCell(level) {
         } catch (err) { log(`[SUPPORT ${ts()}] guaranteed seed solve failed`, err); }
         // 既存seedで解法を見つけられない場合は、ランダムseedを生成して実際に完走できたものだけ採用する。
         for (let attempt = 1; attempt <= 4; attempt++) {
-            const seed = nextPregenerationSeed(mode, level);
+            const seed = nextPregenerationSeed("freecell", level);
             menuNetworkStatus = `解法付きseedを生成中... ${attempt}/4`;
             if (screen === "menu") rerender();
             const solved = await solveFreeCellSeed(level, seed);
             if (!solved) continue;
             // ソルバーで完走確認できたseedは通常のクリア保証共有庫にも登録する。
             try {
-                await (0, clearSeedApi_1.registerVerifiedSeed)("freecell", level, seed, solved.dealVersion, solved.moves.length);
                 await (0, clearSeedApi_1.registerSolvedRoute)("freecell", level, seed, solved.dealVersion, solved.moves, FREECELL_SOLVER_VERSION, false);
             } catch (err) { log(`[SUPPORT ${ts()}] verified seed upload failed`, err); }
             return { seed, source: "guaranteed", supportMoves: solved.moves };
@@ -6032,6 +6067,16 @@ async function resolveSupportedKlondike(level) {
     startBusy = true;
     try {
         const dealV = (0, dealVersion_1.getDealVersion)("klondike");
+        const localCached = cachedSolutionForMode("klondike", level, dealV);
+        if (localCached) {
+            const temp = new session_1.GameSession("klondike", level, Number(localCached.seed) >>> 0);
+            if (prepareSupportRoute(temp, localCached.moves)) {
+                const verified = supportRoute.slice(); clearSupportRuntime();
+                menuNetworkStatus = `端末キャッシュから開始（${verified.length}手）`;
+                return { seed: Number(localCached.seed) >>> 0, source: "guaranteed", supportMoves: verified };
+            }
+            clearSupportRuntime();
+        }
         menuNetworkStatus = "解析済みクロンダイクseedを取得中...";
         if (screen === "menu") rerender();
         try {
@@ -6125,6 +6170,18 @@ async function resolveSupportedSpider(level) {
     startBusy = true;
     try {
         const dealV = (0, dealVersion_1.getDealVersion)("spider");
+        const localCached = cachedSolutionForMode("spider", level, dealV);
+        if (localCached) {
+            const temp = new session_1.GameSession("spider", level, Number(localCached.seed) >>> 0);
+            const compacted = compactSpiderRoute(temp.state, localCached.moves);
+            if (prepareSupportRoute(temp, compacted)) {
+                const verified = supportRoute.slice(); clearSupportRuntime();
+                saveSpiderSolutionCache(level, Number(localCached.seed) >>> 0, dealV, verified);
+                menuNetworkStatus = `端末キャッシュから開始（${verified.length}手）`;
+                return { seed: Number(localCached.seed) >>> 0, source: "guaranteed", supportMoves: verified };
+            }
+            clearSupportRuntime();
+        }
         menuNetworkStatus = "解析済みスパイダーseedを取得中...";
         if (screen === "menu") rerender();
         try {
@@ -6169,12 +6226,18 @@ async function resolveSeedForStart(mode, level) {
             source: "random",
         };
     }
+    const dealV = (0, dealVersion_1.getDealVersion)(mode);
+    const localGuaranteed = cachedSolutionForMode(mode, level, dealV);
+    if (localGuaranteed) {
+        menuNetworkStatus = "端末に保存済みのクリア保証seedから開始";
+        return { seed: Number(localGuaranteed.seed) >>> 0, source: "guaranteed" };
+    }
     startBusy = true;
     menuNetworkStatus = "クリア保証seedを取得中...";
     if (screen === "menu")
         rerender();
     try {
-        const got = await (0, clearSeedApi_1.fetchGuaranteedSeed)(mode, level, (0, dealVersion_1.getDealVersion)(mode));
+        const got = await (0, clearSeedApi_1.fetchGuaranteedSeed)(mode, level, dealV);
         if (!got) {
             menuNetworkStatus = `このゲームのレベル${level}には、クリア済みseedがまだありません`;
             return null;
@@ -6657,11 +6720,25 @@ const dnd = (0, dndCore_1.createDnD)({
 // 画面描画
 // -------------------------------------------------
 
-let solverToolsCounts = {
+const SOLVER_COUNTS_CACHE_KEY = "SolitaireSolverCountsCacheV1";
+const SOLVER_COUNTS_CACHE_TTL_MS = 15 * 60 * 1000;
+function readSolverCountsCache() {
+    try {
+        const v = JSON.parse(localStorage.getItem(SOLVER_COUNTS_CACHE_KEY) || "null");
+        if (!v || !v.counts || !Number.isFinite(Number(v.ts))) return null;
+        return { counts: v.counts, ts: Number(v.ts) };
+    } catch { return null; }
+}
+function saveSolverCountsCache() {
+    try { localStorage.setItem(SOLVER_COUNTS_CACHE_KEY, JSON.stringify({ ts: solverToolsCountsLoadedAt, counts: solverToolsCounts })); } catch {}
+}
+const initialSolverCountsCache = readSolverCountsCache();
+let solverToolsCounts = initialSolverCountsCache?.counts || {
     freecell: [null, null, null],
     klondike: [null, null, null],
     spider: [null, null, null],
 };
+let solverToolsCountsLoadedAt = initialSolverCountsCache?.ts || 0;
 let solverToolsCountsLoading = false;
 async function refreshSolverToolsCounts() {
     if (solverToolsCountsLoading) return;
@@ -6676,6 +6753,8 @@ async function refreshSolverToolsCounts() {
             }
             solverToolsCounts[mode] = vals;
         }
+        solverToolsCountsLoadedAt = Date.now();
+        saveSolverCountsCache();
     } finally {
         solverToolsCountsLoading = false;
         if (screen === "menu" && solverToolsVisible) rerender();
@@ -6717,39 +6796,53 @@ async function runSolvedSeedPregeneration(mode, level, targetCount) {
     const wanted = Math.max(1, Math.min(100, Number(targetCount) | 0));
     const maxAttempts = wanted * (mode === "spider" ? (level === 1 ? 80 : level === 2 ? 220 : 500) : 25);
     let solvedCount = 0, attempts = 0, unresolved = 0;
+    let uploadQueue = [];
     const label = mode === "freecell" ? "フリーセル" : mode === "klondike" ? "クロンダイク" : "スパイダー";
+    const dealV = (0, dealVersion_1.getDealVersion)(mode);
+    const flushQueue = async () => {
+        if (!uploadQueue.length) return true;
+        const sending = uploadQueue.splice(0, Math.min(50, uploadQueue.length));
+        try {
+            // Worker側がsolutions保存と同時にクリア保証seed庫へもINSERTするため、POSTはこれ1回だけ。
+            const result = await (0, clearSeedApi_1.registerSolvedRoutesBatch)(sending);
+            solvedCount += sending.length;
+            if (Number.isInteger(Number(result?.count))) solverToolsCounts[mode][level - 1] = Number(result.count) | 0;
+            solverToolsCountsLoadedAt = Date.now();
+            saveSolverCountsCache();
+            return true;
+        } catch (err) {
+            uploadQueue = sending.concat(uploadQueue);
+            solverToolsStatus = `サーバー登録失敗: ${String(err?.message || err)}（解析結果はこの画面を閉じるまで保持）`;
+            return false;
+        }
+    };
     try {
-        const dealV = (0, dealVersion_1.getDealVersion)(mode);
-        while (!solverToolsStopRequested && solvedCount < wanted && attempts < maxAttempts) {
+        while (!solverToolsStopRequested && (solvedCount + uploadQueue.length) < wanted && attempts < maxAttempts) {
             attempts++;
-            const seed = Math.floor(Math.random() * 2 ** 32) >>> 0;
-            solverToolsStatus = `${label} Lv${level}: ${solvedCount}/${wanted}件　解析 ${attempts}/${maxAttempts}　未解決 ${unresolved}　seed ${seed}`;
+            const seed = nextPregenerationSeed(mode, level);
+            solverToolsStatus = `${label} Lv${level}: ${solvedCount + uploadQueue.length}/${wanted}件　解析 ${attempts}/${maxAttempts}　未解決 ${unresolved}　seed ${seed}`;
             if (screen === "menu") rerender();
             const solved = await solveSeedForTool(mode, level, seed);
             if (!solved) { unresolved++; continue; }
-            try {
-                await (0, clearSeedApi_1.registerSolvedRoute)(mode, level, seed, dealV, solved.moves, solverVersionForMode(mode), !!solved.optimal);
-                // 解析済みルートは通常のクリア保証seed共有庫にも入れておく。
-                try { await (0, clearSeedApi_1.registerVerifiedSeed)(mode, level, seed, dealV, solved.moves.length); } catch {}
-                solvedCount++;
-                const cur = solverToolsCounts[mode]?.[level - 1];
-                if (Number.isInteger(cur)) solverToolsCounts[mode][level - 1] = cur + 1;
-                solverToolsStatus = `${label} Lv${level}: ${solvedCount}/${wanted}件登録済み（試行 ${attempts} / 未解決 ${unresolved}）`;
-                if (screen === "menu") rerender();
-            } catch (err) {
-                solverToolsStatus = `サーバー登録失敗: ${String(err?.message || err)}`;
-                break;
+            uploadQueue.push({ mode, level, seed, dealVersion: dealV, moves: solved.moves, solverVersion: solverVersionForMode(mode), optimal: !!solved.optimal });
+            // 1seedごとの通信はせず、10件単位（終了時は残り全部）でまとめて送信。
+            if (uploadQueue.length >= 10 || solvedCount + uploadQueue.length >= wanted) {
+                if (!await flushQueue()) break;
             }
+            solverToolsStatus = `${label} Lv${level}: ${solvedCount}/${wanted}件登録済み（試行 ${attempts} / 未解決 ${unresolved}）`;
+            if (screen === "menu") rerender();
         }
-        if (solverToolsStopRequested) solverToolsStatus = `停止しました。${label} Lv${level} ${solvedCount}件生成`;
+        if (uploadQueue.length && !solverToolsStopRequested) await flushQueue();
+        else if (uploadQueue.length && solverToolsStopRequested) await flushQueue();
+        if (solverToolsStopRequested) solverToolsStatus = `停止しました。${label} Lv${level} ${solvedCount}件登録`;
         else if (solvedCount >= wanted) solverToolsStatus = `完了: ${label} Lv${level} ${solvedCount}件を事前生成しました（未解決 ${unresolved}）`;
-        else solverToolsStatus = `終了: ${label} Lv${level} ${solvedCount}/${wanted}件（試行上限 / 未解決 ${unresolved}）`;
-        await refreshSolverToolsCounts();
+        else if (!solverToolsStatus.startsWith("サーバー登録失敗")) solverToolsStatus = `終了: ${label} Lv${level} ${solvedCount}/${wanted}件（試行上限 / 未解決 ${unresolved}）`;
     } finally {
         solverToolsBusy = false;
         if (screen === "menu") rerender();
     }
 }
+
 function renderSolverToolsPanel(rootEl) {
     if (!solverToolsVisible || screen !== "menu") return;
     const panel = document.createElement("div");
@@ -6801,13 +6894,14 @@ function renderSolverToolsPanel(rootEl) {
     row.append(modeSel, levelSel, countInput, startBtn, stop, refresh); panel.appendChild(row);
     const note = document.createElement("div");
     note.style.cssText = "font-size:11px;color:#aaa;margin-top:8px;line-height:1.5";
-    note.textContent = "Web Workerで解析し、完走検証できたseed+ルートだけCloudflareへ保存します。Spider Lv2/Lv3は高負荷です。Lv2/Lv3は列対称性を除外した高難度探索を使い、ルートの不要手も自動短縮します。";
+    note.textContent = "解析はPC内のWeb Workerで実行します。Cloudflareへは完走確認済みルートを10件単位でまとめて保存します。件数表示は15分キャッシュし、自動ポーリングはしません。";
     panel.appendChild(note);
     if (solverToolsStatus) {
         const st = document.createElement("div"); st.style.cssText = "font-size:12px;color:#8dffba;margin-top:8px;white-space:pre-wrap"; st.textContent = solverToolsStatus; panel.appendChild(st);
     }
     rootEl.appendChild(panel);
-    if (["freecell","klondike","spider"].every(m => (solverToolsCounts[m] || []).every(v => v == null)) && !solverToolsCountsLoading) setTimeout(() => void refreshSolverToolsCounts(), 0);
+    const countsStale = Date.now() - solverToolsCountsLoadedAt > SOLVER_COUNTS_CACHE_TTL_MS;
+    if (!solverToolsCountsLoading && countsStale) setTimeout(() => void refreshSolverToolsCounts(), 0);
 }
 
 function rerender() {
@@ -7194,6 +7288,7 @@ exports.fetchGuaranteedSeed = fetchGuaranteedSeed;
 exports.registerVerifiedSeed = registerVerifiedSeed;
 exports.fetchSolvedRoute = fetchSolvedRoute;
 exports.registerSolvedRoute = registerSolvedRoute;
+exports.registerSolvedRoutesBatch = registerSolvedRoutesBatch;
 exports.fetchSolvedRouteStats = fetchSolvedRouteStats;
 exports.pendingClearSeedCount = pendingClearSeedCount;
 exports.identityForRecord = identityForRecord;
@@ -7307,10 +7402,17 @@ async function fetchSolvedRoute(mode, level, dealVersion) {
     };
 }
 /** ソルバーで完走検証したルートを共有庫へ登録。 */
+async function registerSolvedRoutesBatch(records) {
+    const clean = Array.isArray(records) ? records.filter(r => r && Array.isArray(r.moves) && r.moves.length).slice(0, 50).map(r => ({
+        mode: String(r.mode || ""), level: Number(r.level) | 0, seed: Number(r.seed) >>> 0, dealVersion: Number(r.dealVersion) | 0,
+        moves: r.moves, solverVersion: Math.max(1, Number(r.solverVersion || 1) | 0), optimal: !!r.optimal,
+    })) : [];
+    if (!clean.length) return { ok: true, inserted: 0, updated: 0, count: 0 };
+    return await fetchJson("/api/solved-routes/batch", { method: "POST", body: JSON.stringify({ records: clean }) });
+}
 async function registerSolvedRoute(mode, level, seed, dealVersion, moves, solverVersion = 1, optimal = false) {
     if (!Array.isArray(moves) || !moves.length) return false;
-    const record = { mode, level: level | 0, seed: seed >>> 0, dealVersion: dealVersion | 0, moves, solverVersion: solverVersion | 0, optimal: !!optimal };
-    const body = await fetchJson("/api/solved-routes/batch", { method: "POST", body: JSON.stringify({ records: [record] }) });
+    const body = await registerSolvedRoutesBatch([{ mode, level, seed, dealVersion, moves, solverVersion, optimal }]);
     return !!body?.ok;
 }
 async function fetchSolvedRouteStats(mode, level, dealVersion) {
