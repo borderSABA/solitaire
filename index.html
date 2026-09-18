@@ -1177,7 +1177,7 @@ body {
 </head>
 <body>
 <div id="felt-wrapper"><div id="game-scale-wrapper"><div id="app"></div></div></div>
-<div id="version-badge" class="version-badge" aria-label="version">v1.5.0</div>
+<div id="version-badge" class="version-badge" aria-label="version">v1.5.1</div>
 <script>
 (function(){
 "use strict";
@@ -2574,6 +2574,11 @@ function solverWorkerMain() {
   function stateKey(st) {
     return `${st.completed};${st.stock.join(",")};` + st.cols.map((c, i) => `${st.up[i]}:${c.join(".")}`).join("|");
   }
+  // Spiderの列は物理位置を除けば対称。高難度探索では列順を正規化して同型盤面をまとめる。
+  function stateKeyHard(st) {
+    const cols = st.cols.map((c, i) => `${st.up[i]}:${c.join(".")}`).sort();
+    return `${st.completed};${st.stock.join(",")};${cols.join("|")}`;
+  }
   function movableStarts(col, u) {
     if (!col.length) return [];
     const out = [col.length - 1];
@@ -2623,10 +2628,44 @@ function solverWorkerMain() {
   }
   function score(st) {
     const m = metrics(st);
-    // face-downを減らすことを最優先。山札が残り、裏札が0なら空列を一旦埋めて次のdealへ進みやすくする。
+    // Lv1向けの従来評価。既存の成功率を壊さないため残す。
     const emptyTerm = st.stock.length ? (m.hidden === 0 ? -30000 : 10000) : 18000;
     return st.completed * 10000000 - m.hidden * 150000 - st.stock.length * 7000 +
       m.empty * emptyTerm + m.same * 1800 + m.clean * 100 + m.topMob * 80;
+  }
+  function metricsHard(st) {
+    let hidden = 0, empty = 0, samePairs = 0, mixedPairs = 0, topRunSum = 0, topRunSq = 0, faceup = 0;
+    for (let ci = 0; ci < 10; ci++) {
+      const c = st.cols[ci];
+      hidden += Math.min(st.up[ci], c.length);
+      if (!c.length) { empty++; continue; }
+      faceup += Math.max(0, c.length - st.up[ci]);
+      for (let i = Math.max(st.up[ci], 0); i < c.length - 1; i++) {
+        if (rank(c[i]) === rank(c[i + 1]) + 1) {
+          if (suit(c[i]) === suit(c[i + 1])) samePairs++;
+          else mixedPairs++;
+        }
+      }
+      let tr = 1;
+      for (let i = c.length - 2; i >= st.up[ci]; i--) {
+        if (suit(c[i]) === suit(c[i + 1]) && rank(c[i]) === rank(c[i + 1]) + 1) tr++;
+        else break;
+      }
+      topRunSum += tr;
+      topRunSq += tr * tr;
+    }
+    return { hidden, empty, samePairs, mixedPairs, topRunSum, topRunSq, faceup };
+  }
+  function scoreHard(st) {
+    const m = metricsHard(st);
+    // 2/4スートでは「裏札を開ける」「同スート連結」「完成」を優先。
+    // 山札消費自体にはほぼ加点せず、早すぎるdealを避ける。
+    let sc = st.completed * 20000000 - m.hidden * 220000 +
+      m.samePairs * 8000 - m.mixedPairs * 1200 +
+      m.topRunSq * 650 + m.topRunSum * 250 + m.faceup * 300;
+    sc += m.empty * (m.hidden > 0 ? 22000 : (st.stock.length ? -20000 : 35000));
+    sc += st.stock.length * 180;
+    return sc;
   }
   function outputMove(st, raw) {
     if (raw.kind === "deal") return { kind: "deal" };
@@ -2667,26 +2706,78 @@ function solverWorkerMain() {
     }
     return out;
   }
+  function topSameRunStart(col, u) {
+    if (!col.length) return 0;
+    let s = col.length - 1;
+    while (s - 1 >= u && suit(col[s - 1]) === suit(col[s]) && rank(col[s - 1]) === rank(col[s]) + 1) s--;
+    return s;
+  }
+  function candidatesHard(st) {
+    const out = [];
+    const empties = [];
+    for (let i = 0; i < 10; i++) if (!st.cols[i].length) empties.push(i);
+    const emptyTarget = empties.length ? empties[0] : -1; // 空列は対称なので代表1列だけ
+    for (let from = 0; from < 10; from++) {
+      const col = st.cols[from];
+      if (!col.length) continue;
+      const topRunStart = topSameRunStart(col, st.up[from]);
+      for (const start of movableStarts(col, st.up[from])) {
+        const head = col[start];
+        const reveals = start === st.up[from] && st.up[from] > 0;
+        const movingWholeVisibleColumn = start === 0 && st.up[from] === 0;
+        for (let to = 0; to < 10; to++) {
+          if (to === from) continue;
+          const dst = st.cols[to];
+          if (!dst.length) {
+            if (to !== emptyTarget) continue;
+            // 完全に表の列をそのまま空列へ移すだけなら列名交換と同じで無駄。
+            if (movingWholeVisibleColumn) continue;
+          } else if (rank(head) !== rank(dst[dst.length - 1]) - 1) continue;
+          const sameJoin = !!dst.length && suit(head) === suit(dst[dst.length - 1]);
+          // 既存の同スート列を途中で切って異スートへ逃がす手は、裏札を開けない限り強く抑制。
+          if (!reveals && !sameJoin && start > topRunStart && dst.length) continue;
+          const raw = { kind: "move", from, start, to };
+          const next = apply(st, raw);
+          if (!next) continue;
+          let bonus = 0;
+          if (reveals) bonus += 120000;
+          if (sameJoin) bonus += 30000;
+          if (!dst.length) bonus += reveals ? 15000 : -5000;
+          out.push({ state: next, move: outputMove(st, raw), score: scoreHard(next) + bonus });
+        }
+      }
+    }
+    if (st.stock.length >= 10 && !st.cols.some(c => !c.length)) {
+      const raw = { kind: "deal" };
+      const next = apply(st, raw);
+      if (next) out.push({ state: next, move: { kind: "deal" }, score: scoreHard(next) - 25000 });
+    }
+    return out;
+  }
   function solve(input, options) {
     const maxMs = Math.max(500, Number(options.maxMs || 10000));
     const maxNodes = Math.max(10000, Number(options.maxNodes || 1800000) | 0);
     const maxDepth = Math.max(120, Number(options.maxDepth || 380) | 0);
     const beamWidth = Math.max(100, Number(options.beamWidth || 900) | 0);
+    const hard = options.profile === "hard";
     const started = Date.now();
     let expanded = 0;
     const init = normalize(fromInput(input));
-    let frontier = [{ state: init, path: [] }];
-    const seen = new Map([[stateKey(init), 0]]);
-    let best = { score: score(init), completed: init.completed, hidden: metrics(init).hidden, stock: init.stock.length };
+    const keyFn = hard ? stateKeyHard : stateKey;
+    const scoreFn = hard ? scoreHard : score;
+    const candFn = hard ? candidatesHard : candidates;
+    let frontier = [{ state: init, path: [], score: scoreFn(init) }];
+    const seen = new Map([[keyFn(init), 0]]);
+    let best = { score: scoreFn(init), completed: init.completed, hidden: (hard ? metricsHard(init).hidden : metrics(init).hidden), stock: init.stock.length };
     for (let depth = 0; depth < maxDepth && frontier.length; depth++) {
       const nextFrontier = [];
       for (const node of frontier) {
-        for (const item of candidates(node.state)) {
+        for (const item of candFn(node.state)) {
           expanded++;
           if ((expanded & 1023) === 0 && (expanded >= maxNodes || Date.now() - started >= maxMs)) {
             return { ok: false, moves: [], nodes: expanded, elapsedMs: Date.now() - started, optimal: false, best };
           }
-          const k = stateKey(item.state);
+          const k = keyFn(item.state);
           const old = seen.get(k);
           if (old !== undefined && old <= depth + 1) continue;
           seen.set(k, depth + 1);
@@ -2694,13 +2785,30 @@ function solverWorkerMain() {
           if (item.state.completed >= 8 && !item.state.stock.length && item.state.cols.every(c => !c.length)) {
             return { ok: true, moves: path, nodes: expanded, elapsedMs: Date.now() - started, optimal: false };
           }
-          const mm = metrics(item.state);
+          const mm = hard ? metricsHard(item.state) : metrics(item.state);
           if (item.score > best.score) best = { score: item.score, completed: item.state.completed, hidden: mm.hidden, stock: item.state.stock.length };
           nextFrontier.push({ state: item.state, path, score: item.score });
         }
       }
       nextFrontier.sort((a, b) => b.score - a.score);
-      frontier = nextFrontier.slice(0, beamWidth);
+      if (!hard) {
+        frontier = nextFrontier.slice(0, beamWidth);
+      } else {
+        // 同じ進捗帯だけでbeamが埋まらないよう、少し多様性を残す。
+        const kept = [];
+        const buckets = new Map();
+        const perBucket = Math.max(8, Math.floor(beamWidth / 80));
+        for (const n of nextFrontier) {
+          const m = metricsHard(n.state);
+          const sig = `${n.state.completed}/${m.hidden}/${n.state.stock.length}/${m.empty}/${Math.floor(m.samePairs / 4)}`;
+          const cnt = buckets.get(sig) || 0;
+          if (cnt >= perBucket) continue;
+          buckets.set(sig, cnt + 1);
+          kept.push(n);
+          if (kept.length >= beamWidth) break;
+        }
+        frontier = kept;
+      }
       if (Date.now() - started >= maxMs || expanded >= maxNodes) break;
     }
     return { ok: false, moves: [], nodes: expanded, elapsedMs: Date.now() - started, optimal: false, best };
@@ -3550,7 +3658,7 @@ const KLONDIKE_SOLVER_VERSION = 1;
 const FREECELL_SOLVER_VERSION = 1;
 const SPIDER_SUPPORT_KEY = "SolitaireSpiderSupportV1";
 const SPIDER_SOLUTION_CACHE_KEY = "SolitaireSpiderSolutionCacheV1";
-const SPIDER_SOLVER_VERSION = 1;
+const SPIDER_SOLVER_VERSION = 2;
 function loadFreeCellSupportEnabled() { try { return localStorage.getItem(FREECELL_SUPPORT_KEY) === "1"; } catch { return false; } }
 function saveFreeCellSupportEnabled(v) { try { localStorage.setItem(FREECELL_SUPPORT_KEY, v ? "1" : "0"); } catch {} }
 function loadKlondikeSupportEnabled() { try { return localStorage.getItem(KLONDIKE_SUPPORT_KEY) === "1"; } catch { return false; } }
@@ -5298,6 +5406,59 @@ function applySpiderSupportMoveState(state, move) {
     spiderRemoveCompletedRunsSync(st);
     return st;
 }
+function spiderRouteWins(initialState, moves) {
+    let state = JSON.parse(JSON.stringify(initialState));
+    const normalized = [];
+    for (const raw of moves) {
+        const m = normalizeSpiderSupportMove(raw);
+        if (!m) return null;
+        const next = applySpiderSupportMoveState(state, m);
+        if (!next) return null;
+        state = next;
+        normalized.push(m);
+    }
+    if (Number(state.completedStacks || 0) !== 8 || (state.stock || []).length || state.columns.some(col => col.length)) return null;
+    return normalized;
+}
+function compactSpiderRoute(initialState, moves) {
+    let route = spiderRouteWins(initialState, moves);
+    if (!route) return Array.isArray(moves) ? moves : [];
+    // まず、消しても完走できる1～3手のブロックを後ろから削る。
+    for (let pass = 0; pass < 3; pass++) {
+        let changed = false;
+        for (const blockLen of [3, 2, 1]) {
+            for (let i = Math.max(0, route.length - blockLen); i >= 0; i--) {
+                if (i + blockLen > route.length) continue;
+                const candidate = route.slice(0, i).concat(route.slice(i + blockLen));
+                const ok = spiderRouteWins(initialState, candidate);
+                if (ok) { route = ok; changed = true; }
+            }
+        }
+        if (!changed) break;
+    }
+    // A→B→C と同じ束を一時置きしただけの連続2手は A→C へ短縮できるか試す。
+    for (let pass = 0; pass < 2; pass++) {
+        let changed = false;
+        let prefixState = JSON.parse(JSON.stringify(initialState));
+        for (let i = 0; i + 1 < route.length; i++) {
+            const a = route[i], b = route[i + 1];
+            if (a.kind === "move" && b.kind === "move" && b.from.index === a.to.index) {
+                const dstBeforeLen = prefixState.columns[a.to.index]?.length ?? -1;
+                if (b.from.startIndex === dstBeforeLen) {
+                    const direct = { kind: "move", from: { type: "tableau", index: a.from.index, startIndex: a.from.startIndex }, to: { type: "tableau", index: b.to.index }, cards: a.cards || [] };
+                    const candidate = route.slice(0, i).concat([direct], route.slice(i + 2));
+                    const ok = spiderRouteWins(initialState, candidate);
+                    if (ok) { route = ok; changed = true; break; }
+                }
+            }
+            const nextPrefix = applySpiderSupportMoveState(prefixState, a);
+            if (!nextPrefix) break;
+            prefixState = nextPrefix;
+        }
+        if (!changed) break;
+    }
+    return route;
+}
 function prepareSupportRoute(sess, moves) {
     clearSupportRuntime();
     if (!sess || !Array.isArray(moves) || !moves.length) return false;
@@ -5628,7 +5789,7 @@ async function resolveSupportedFreeCell(level) {
         } catch (err) { log(`[SUPPORT ${ts()}] guaranteed seed solve failed`, err); }
         // 既存seedで解法を見つけられない場合は、ランダムseedを生成して実際に完走できたものだけ採用する。
         for (let attempt = 1; attempt <= 4; attempt++) {
-            const seed = Math.floor(Math.random() * 2 ** 32) >>> 0;
+            const seed = nextPregenerationSeed(mode, level);
             menuNetworkStatus = `解法付きseedを生成中... ${attempt}/4`;
             if (screen === "menu") rerender();
             const solved = await solveFreeCellSeed(level, seed);
@@ -5682,7 +5843,8 @@ async function solveKlondikeSeed(level, seed, options = {}) {
     const maxNodes = Math.max(50000, Number(options.maxNodes || (level >= 3 ? 520000 : 420000)));
     const result = await (0, klondikeSolver_1.solveKlondikeState)(temp.state, { maxMs, maxNodes });
     if (!result?.ok || !Array.isArray(result.moves) || !result.moves.length) return null;
-    if (!prepareSupportRoute(temp, result.moves)) { clearSupportRuntime(); return null; }
+    const compactedMoves = compactSpiderRoute(temp.state, result.moves);
+    if (!prepareSupportRoute(temp, compactedMoves)) { clearSupportRuntime(); return null; }
     const verifiedMoves = supportRoute.slice();
     clearSupportRuntime();
     saveKlondikeSolutionCache(level, seed, temp.dealVersion, verifiedMoves);
@@ -5769,10 +5931,10 @@ async function solveSpiderSeed(level, seed, options = {}) {
         clearSupportRuntime();
     }
     const defaults = level === 1
-        ? { maxMs: 12000, maxNodes: 2200000, beamWidth: 1200 }
+        ? { maxMs: 14000, maxNodes: 2600000, beamWidth: 1400, profile: "classic" }
         : level === 2
-            ? { maxMs: 30000, maxNodes: 3500000, beamWidth: 1400 }
-            : { maxMs: 45000, maxNodes: 4800000, beamWidth: 1600 };
+            ? { maxMs: 45000, maxNodes: 7000000, maxDepth: 440, beamWidth: 2400, profile: "hard" }
+            : { maxMs: 90000, maxNodes: 12000000, maxDepth: 520, beamWidth: 3600, profile: "hard" };
     const result = await (0, spiderSolver_1.solveSpiderState)(temp.state, { ...defaults, ...options });
     if (!result?.ok || !Array.isArray(result.moves) || !result.moves.length) return null;
     if (!prepareSupportRoute(temp, result.moves)) { clearSupportRuntime(); return null; }
@@ -5791,10 +5953,14 @@ async function resolveSupportedSpider(level) {
             const solvedServer = await (0, clearSeedApi_1.fetchSolvedRoute)("spider", level, dealV);
             if (solvedServer) {
                 const temp = new session_1.GameSession("spider", level, solvedServer.seed >>> 0);
-                if (prepareSupportRoute(temp, solvedServer.moves)) {
+                const compacted = compactSpiderRoute(temp.state, solvedServer.moves);
+                if (prepareSupportRoute(temp, compacted)) {
                     const verified = supportRoute.slice(); clearSupportRuntime();
                     saveSpiderSolutionCache(level, solvedServer.seed, dealV, verified);
-                    menuNetworkStatus = `解析済みseedから開始（登録済み ${solvedServer.count}件）`;
+                    if (verified.length < solvedServer.moves.length) {
+                        void (0, clearSeedApi_1.registerSolvedRoute)("spider", level, solvedServer.seed >>> 0, dealV, verified, SPIDER_SOLVER_VERSION, false).catch(() => {});
+                    }
+                    menuNetworkStatus = `解析済みseedから開始（登録済み ${solvedServer.count}件 / ${verified.length}手）`;
                     return { seed: solvedServer.seed >>> 0, source: "guaranteed", supportMoves: verified };
                 }
                 clearSupportRuntime();
@@ -6341,22 +6507,37 @@ async function solveSeedForTool(mode, level, seed) {
     if (mode === "freecell") return await solveFreeCellSeed(level, seed);
     if (mode === "klondike") return await solveKlondikeSeed(level, seed, { maxMs: level >= 3 ? 4500 : 3200, maxNodes: level >= 3 ? 500000 : 360000 });
     return await solveSpiderSeed(level, seed, level === 1
-        ? { maxMs: 12000, maxNodes: 2200000, beamWidth: 1200 }
+        ? { maxMs: 14000, maxNodes: 2600000, beamWidth: 1400, profile: "classic" }
         : level === 2
-            ? { maxMs: 30000, maxNodes: 3500000, beamWidth: 1400 }
-            : { maxMs: 45000, maxNodes: 4800000, beamWidth: 1600 });
+            ? { maxMs: 45000, maxNodes: 7000000, maxDepth: 440, beamWidth: 2400, profile: "hard" }
+            : { maxMs: 90000, maxNodes: 12000000, maxDepth: 520, beamWidth: 3600, profile: "hard" });
 }
 function solverVersionForMode(mode) {
     if (mode === "freecell") return FREECELL_SOLVER_VERSION;
     if (mode === "klondike") return KLONDIKE_SOLVER_VERSION;
     return SPIDER_SOLVER_VERSION;
 }
+function nextPregenerationSeed(mode, level) {
+    if (mode !== "spider") return Math.floor(Math.random() * 2 ** 32) >>> 0;
+    const warm = level === 1 ? [7] : level === 2 ? [4] : [];
+    const warmKey = `SpiderSolverWarmV2_L${level}`;
+    let wi = Number(localStorage.getItem(warmKey) || 0) | 0;
+    if (wi < warm.length) {
+        localStorage.setItem(warmKey, String(wi + 1));
+        return warm[wi] >>> 0;
+    }
+    const key = `SpiderSolverCursorV2_L${level}`;
+    let seed = Number(localStorage.getItem(key));
+    if (!Number.isInteger(seed) || seed < 1) seed = 1;
+    localStorage.setItem(key, String((seed + 1) >>> 0));
+    return seed >>> 0;
+}
 async function runSolvedSeedPregeneration(mode, level, targetCount) {
     if (solverToolsBusy) return;
     solverToolsBusy = true;
     solverToolsStopRequested = false;
     const wanted = Math.max(1, Math.min(100, Number(targetCount) | 0));
-    const maxAttempts = wanted * (mode === "spider" ? (level === 1 ? 80 : level === 2 ? 160 : 260) : 25);
+    const maxAttempts = wanted * (mode === "spider" ? (level === 1 ? 80 : level === 2 ? 220 : 500) : 25);
     let solvedCount = 0, attempts = 0, unresolved = 0;
     const label = mode === "freecell" ? "フリーセル" : mode === "klondike" ? "クロンダイク" : "スパイダー";
     try {
@@ -6442,7 +6623,7 @@ function renderSolverToolsPanel(rootEl) {
     row.append(modeSel, levelSel, countInput, startBtn, stop, refresh); panel.appendChild(row);
     const note = document.createElement("div");
     note.style.cssText = "font-size:11px;color:#aaa;margin-top:8px;line-height:1.5";
-    note.textContent = "Web Workerで解析し、実際に完走検証できたseed+ルートだけCloudflareへ保存します。SpiderはLv2/Lv3ほど重く、未解決seedは捨てて次を試します。";
+    note.textContent = "Web Workerで解析し、完走検証できたseed+ルートだけCloudflareへ保存します。Spider Lv2/Lv3は高負荷です。Lv2/Lv3は列対称性を除外した高難度探索を使い、ルートの不要手も自動短縮します。";
     panel.appendChild(note);
     if (solverToolsStatus) {
         const st = document.createElement("div"); st.style.cssText = "font-size:12px;color:#8dffba;margin-top:8px;white-space:pre-wrap"; st.textContent = solverToolsStatus; panel.appendChild(st);
@@ -8884,8 +9065,14 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
         supportWrap.appendChild(supportDesc);
         screen.appendChild(supportWrap);
     }
+    const backBtn = document.createElement("button");
+    backBtn.className = "menu-btn active";
+    backBtn.textContent = "← ゲーム選択に戻る";
+    backBtn.disabled = !!opts.startBusy;
+    backBtn.addEventListener("click", handlers.onBackModeSelect);
     const levelList = document.createElement("div");
     levelList.className = "menu-list";
+    levelList.appendChild(backBtn);
     for (const level of [1, 2, 3]) {
         const b = document.createElement("button");
         b.className = "menu-btn active";
@@ -8901,12 +9088,6 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
         status.textContent = opts.statusText;
         screen.appendChild(status);
     }
-    const backBtn = document.createElement("button");
-    backBtn.className = "menu-back-btn";
-    backBtn.textContent = "← ゲーム選択に戻る";
-    backBtn.disabled = !!opts.startBusy;
-    backBtn.addEventListener("click", handlers.onBackModeSelect);
-    screen.appendChild(backBtn);
     root.appendChild(screen);
 }
 
