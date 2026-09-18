@@ -1150,6 +1150,14 @@ body {
 .support-toggle.off { background:#262626; color:#bbb; }
 .support-desc { margin-top:6px; color:#aaa; font-size:12px; line-height:1.45; text-align:center; }
 .support-progress { color:#8dffba; font-size:12px; font-weight:700; white-space:nowrap; }
+.game-meta {
+  color:#ddd; font-size:12px; font-weight:700; white-space:nowrap;
+  padding:4px 8px; border:1px solid #555; border-radius:8px; background:#1a1a1a;
+}
+.support-diagnostic {
+  color:#ffd27a; font-size:11px; font-weight:700; white-space:nowrap;
+  max-width:260px; overflow:hidden; text-overflow:ellipsis;
+}
 .support-hint-btn {
   background:#173f2b; border:1px solid #39d97c; color:#8dffba;
   border-radius:6px; padding:6px 10px; font-weight:800; cursor:pointer;
@@ -1177,7 +1185,7 @@ body {
 </head>
 <body>
 <div id="felt-wrapper"><div id="game-scale-wrapper"><div id="app"></div></div></div>
-<div id="version-badge" class="version-badge" aria-label="version">v1.5.3</div>
+<div id="version-badge" class="version-badge" aria-label="version">v1.5.4</div>
 <script>
 (function(){
 "use strict";
@@ -3677,6 +3685,12 @@ let supportSpiderCanonicalKeyToIndices = new Map();
 let supportRouteIndex = 0;
 let supportOffRoute = false;
 let supportHintVisible = false;
+// Spiderサポート診断/自動復旧。保存seedの解法はprepareSupportRouteで完走検証済み。
+let supportRouteVerified = false;
+let supportRecoveryInFlight = false;
+let supportRecoveryScheduled = false;
+let supportRecoveryFailedKey = "";
+let supportDiagnosticText = "";
 let menuNetworkStatus = "";
 let startBusy = false;
 let seedSyncInFlight = false;
@@ -5376,6 +5390,11 @@ function clearSupportRuntime() {
     supportRouteIndex = 0;
     supportOffRoute = false;
     supportHintVisible = false;
+    supportRouteVerified = false;
+    supportRecoveryInFlight = false;
+    supportRecoveryScheduled = false;
+    supportRecoveryFailedKey = "";
+    supportDiagnosticText = "";
 }
 function normalizeSupportMove(move) {
     if (!move || !move.from || !move.to) return null;
@@ -5613,7 +5632,76 @@ function prepareSupportRoute(sess, moves) {
     supportRouteIndex = 0;
     supportOffRoute = false;
     supportHintVisible = true;
+    supportRouteVerified = true;
+    supportRecoveryFailedKey = "";
+    supportDiagnosticText = "seed解法: 検証済み";
     return true;
+}
+function spiderRecoveryOptions(level) {
+    if (level <= 1) return { maxMs: 12000, maxNodes: 2600000, maxDepth: 420, beamWidth: 1500, profile: "classic" };
+    if (level === 2) return { maxMs: 35000, maxNodes: 7000000, maxDepth: 480, beamWidth: 2600, profile: "hard" };
+    return { maxMs: 60000, maxNodes: 12000000, maxDepth: 560, beamWidth: 3800, profile: "hard" };
+}
+function scheduleSpiderSupportRecovery() {
+    if (!session || session.mode !== "spider" || !supportRouteVerified) return;
+    const key = spiderCanonicalStateKey(session.state);
+    if (supportRecoveryInFlight || supportRecoveryScheduled || supportRecoveryFailedKey === key) return;
+    supportRecoveryScheduled = true;
+    setTimeout(() => {
+        supportRecoveryScheduled = false;
+        void attemptSpiderSupportRecovery(false);
+    }, 80);
+}
+async function attemptSpiderSupportRecovery(force = false) {
+    if (!session || session.mode !== "spider" || supportRecoveryInFlight) return false;
+    const sess = session;
+    const exactKey = spiderStateKey(sess.state);
+    const canonicalKey = spiderCanonicalStateKey(sess.state);
+    if (!force && supportRecoveryFailedKey === canonicalKey) return false;
+    supportRecoveryInFlight = true;
+    supportDiagnosticText = "seed解法は検証済み / 現在盤面を再解析中…";
+    uiState.statusText = supportDiagnosticText;
+    rerender();
+    const snapshot = JSON.parse(JSON.stringify(sess.state));
+    try {
+        const result = await (0, spiderSolver_1.solveSpiderState)(snapshot, spiderRecoveryOptions(sess.level));
+        if (session !== sess) return false;
+        // 解析中に盤面が動いた場合は古い結果を適用しない。新しい盤面で再同期する。
+        if (spiderStateKey(sess.state) !== exactKey) {
+            supportRecoveryInFlight = false;
+            supportDiagnosticText = "盤面更新を検出 / サポート再同期中";
+            syncSupportPosition();
+            rerender();
+            return false;
+        }
+        if (result?.ok && Array.isArray(result.moves) && result.moves.length && prepareSupportRoute(sess, result.moves)) {
+            supportRecoveryInFlight = false;
+            supportRecoveryFailedKey = "";
+            supportDiagnosticText = "現在盤面からサポート再接続済み";
+            supportOffRoute = false;
+            supportHintVisible = true;
+            uiState.statusText = `サポート再開（残り${supportRoute.length}手）`;
+            rerender();
+            return true;
+        }
+        supportRecoveryInFlight = false;
+        supportRecoveryFailedKey = canonicalKey;
+        supportOffRoute = true;
+        supportDiagnosticText = "seed解法は検証済み / 現在盤面の再解析は未解決";
+        uiState.statusText = supportDiagnosticText + "。UNDOで保存ルートへ戻せます";
+        rerender();
+        return false;
+    } catch (err) {
+        if (session !== sess) return false;
+        supportRecoveryInFlight = false;
+        supportRecoveryFailedKey = canonicalKey;
+        supportOffRoute = true;
+        supportDiagnosticText = "seed解法は検証済み / サポート再解析エラー";
+        uiState.statusText = supportDiagnosticText;
+        log(`[S-SUPPORT ${ts()}] recovery failed`, err);
+        rerender();
+        return false;
+    }
 }
 function syncSupportPosition() {
     if (!session || !supportRoute || supportMode !== session.mode) return;
@@ -5622,10 +5710,16 @@ function syncSupportPosition() {
         : supportRouteKeyToIndex.get(currentSupportStateKey(session));
     if (idx === undefined) {
         supportOffRoute = true;
+        if (session.mode === "spider" && supportRouteVerified) {
+            if (!supportRecoveryInFlight) supportDiagnosticText = "seed解法は検証済み / サポート追跡外";
+            scheduleSpiderSupportRecovery();
+        }
     } else {
         supportRouteIndex = idx;
         supportOffRoute = false;
         supportHintVisible = true;
+        supportRecoveryFailedKey = "";
+        if (!supportRecoveryInFlight) supportDiagnosticText = "seed解法: 検証済み";
     }
 }
 function supportMoveLabel(move) {
@@ -5775,7 +5869,10 @@ function restoreSupportRoute() {
 function onSupportHintClick() {
     if (!supportRoute) { uiState.statusText = "サポートルートがありません"; rerender(); return; }
     syncSupportPosition();
-    if (supportOffRoute) { restoreSupportRoute(); return; }
+    if (supportOffRoute) {
+        if (session?.mode === "spider") { supportRecoveryFailedKey = ""; void attemptSpiderSupportRecovery(true); return; }
+        restoreSupportRoute(); return;
+    }
     if (supportRouteIndex >= supportRoute.length) { uiState.statusText = "サポートルート完了です"; rerender(); return; }
     supportHintVisible = true;
     const move = currentSupportMove();
@@ -6887,7 +6984,7 @@ function rerender() {
                 freecells: highlightFree,
                 foundations: highlightFound
             };
-            const supportUi = { ...uiState, supportEnabled: !!supportRoute, supportStep: supportRouteIndex, supportTotal: supportRoute?.length || 0, supportOffRoute };
+            const supportUi = { ...uiState, supportEnabled: !!supportRoute, supportStep: supportRouteIndex, supportTotal: supportRoute?.length || 0, supportOffRoute, supportRecovering: supportRecoveryInFlight, supportDiagnostic: supportDiagnosticText };
             (0, renderGameScreen_1.renderGameScreen)(rootEl, session, supportUi, movableMap, highlightMap, readyForFinish, finishing, gameCleared, {
                 onBackToMenu: () => backToMenu(),
                 onUndoClick: () => undoOneMove(),
@@ -6953,7 +7050,7 @@ function rerender() {
         }
         if (session.mode === "klondike") {
             syncSupportPosition();
-            const supportUiK = { ...uiState, supportEnabled: !!supportRoute && supportMode === "klondike", supportStep: supportRouteIndex, supportTotal: supportRoute?.length || 0, supportOffRoute };
+            const supportUiK = { ...uiState, supportEnabled: !!supportRoute && supportMode === "klondike", supportStep: supportRouteIndex, supportTotal: supportRoute?.length || 0, supportOffRoute, supportRecovering: supportRecoveryInFlight, supportDiagnostic: supportDiagnosticText };
             (0, renderKlondikeScreen_1.renderKlondikeScreen)(rootEl, session, supportUiK, readyForFinish, finishing, gameCleared, {
                 onBackToMenu: () => backToMenu(),
                 onUndoClick: () => undoOneMove(),
@@ -7025,7 +7122,7 @@ function rerender() {
             // 一時的にルート外判定しない。回収終了後に同期する。
             if (!animObjSP?.active && !spiderFindCompleteRun(stSP)) syncSupportPosition();
             const highlightMap = buildSpiderHighlightMap(stSP, uiState.selectedFrom);
-            const supportUiS = { ...uiState, supportEnabled: !!supportRoute && supportMode === "spider", supportStep: supportRouteIndex, supportTotal: supportRoute?.length || 0, supportOffRoute };
+            const supportUiS = { ...uiState, supportEnabled: !!supportRoute && supportMode === "spider", supportStep: supportRouteIndex, supportTotal: supportRoute?.length || 0, supportOffRoute, supportRecovering: supportRecoveryInFlight, supportDiagnostic: supportDiagnosticText };
             (0, renderSpiderScreen_1.renderSpiderScreen)(rootEl, session, supportUiS, highlightMap, gameCleared, {
                 onBackToMenu: () => backToMenu(),
                 onUndoClick: () => undoOneMove(),
@@ -7931,6 +8028,11 @@ function buildTopBar(session, opts, handlers) {
     right.style.alignItems = "center";
     right.style.gap = "8px";
     right.style.flex = "0 0 auto";
+    const gameMeta = document.createElement("div");
+    gameMeta.className = "game-meta";
+    gameMeta.textContent = `seed: ${session.seed >>> 0} / 手数: ${Number(session.turnIndex || 0)}`;
+    gameMeta.title = `現在のseed ${session.seed >>> 0} / 現在手数 ${Number(session.turnIndex || 0)}`;
+    right.appendChild(gameMeta);
     if (opts.supportEnabled && typeof handlers.onSupportHintClick === "function") {
         const progress = document.createElement("div");
         progress.className = "support-progress";
@@ -7938,9 +8040,17 @@ function buildTopBar(session, opts, handlers) {
         right.appendChild(progress);
         const hint = document.createElement("button");
         hint.className = `support-hint-btn ${opts.supportOffRoute ? "offroute" : ""}`;
-        hint.textContent = opts.supportOffRoute ? "ルート復帰" : "サポート ON";
-        hint.addEventListener("click", handlers.onSupportHintClick);
+        hint.textContent = opts.supportRecovering ? "再解析中…" : (opts.supportOffRoute ? "再解析" : "サポート ON");
+        if (opts.supportRecovering) hint.disabled = true;
+        else hint.addEventListener("click", handlers.onSupportHintClick);
         right.appendChild(hint);
+        if ((opts.supportOffRoute || opts.supportRecovering) && opts.supportDiagnostic) {
+            const diag = document.createElement("div");
+            diag.className = "support-diagnostic";
+            diag.textContent = opts.supportDiagnostic;
+            diag.title = opts.supportDiagnostic;
+            right.appendChild(diag);
+        }
     }
     const modeLabel = document.createElement("div");
     modeLabel.textContent = `mode: ${session.mode}`;
