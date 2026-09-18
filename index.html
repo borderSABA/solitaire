@@ -1177,7 +1177,7 @@ body {
 </head>
 <body>
 <div id="felt-wrapper"><div id="game-scale-wrapper"><div id="app"></div></div></div>
-<div id="version-badge" class="version-badge" aria-label="version">v1.5.1</div>
+<div id="version-badge" class="version-badge" aria-label="version">v1.5.2</div>
 <script>
 (function(){
 "use strict";
@@ -6575,7 +6575,7 @@ async function runSolvedSeedPregeneration(mode, level, targetCount) {
 function renderSolverToolsPanel(rootEl) {
     if (!solverToolsVisible || screen !== "menu") return;
     const panel = document.createElement("div");
-    panel.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:9000;width:min(520px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;background:#151515;border:1px solid #666;border-radius:10px;padding:14px;color:#fff;box-shadow:0 10px 35px #000a;font-family:sans-serif";
+    panel.style.cssText = "position:fixed;right:16px;top:56px;z-index:9000;width:min(280px,calc(100vw - 32px));max-height:calc(100vh - 72px);overflow:auto;background:#151515;border:1px solid #666;border-radius:10px;padding:14px;color:#fff;box-shadow:0 10px 35px #000a;font-family:sans-serif";
     const title = document.createElement("div");
     title.textContent = "解析seed 事前生成ツール";
     title.style.cssText = "font-weight:900;font-size:16px;margin-bottom:8px";
@@ -8946,22 +8946,24 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
     title.className = "menu-title";
     title.textContent = "ソリティア";
     screen.appendChild(title);
-    const clearCount = document.createElement("div");
-    clearCount.className = "menu-clear-count";
-    if (!opts.playerName) {
-        clearCount.textContent = "クリア数: ―  （戦績で名前を設定）";
+    if (!pendingMode) {
+        const clearCount = document.createElement("div");
+        clearCount.className = "menu-clear-count";
+        if (!opts.playerName) {
+            clearCount.textContent = "クリア数: ―  （戦績で名前を設定）";
+        }
+        else if (opts.totalClearCount == null) {
+            clearCount.textContent = `${opts.playerName}　クリア数: 読み込み中`;
+        }
+        else {
+            clearCount.textContent = `${opts.playerName}　クリア数: ${opts.totalClearCount}`;
+        }
+        screen.appendChild(clearCount);
+        const sub = document.createElement("div");
+        sub.className = "menu-subtitle";
+        sub.textContent = "遊びたいゲームを選んでください";
+        screen.appendChild(sub);
     }
-    else if (opts.totalClearCount == null) {
-        clearCount.textContent = `${opts.playerName}　クリア数: 読み込み中`;
-    }
-    else {
-        clearCount.textContent = `${opts.playerName}　クリア数: ${opts.totalClearCount}`;
-    }
-    screen.appendChild(clearCount);
-    const sub = document.createElement("div");
-    sub.className = "menu-subtitle";
-    sub.textContent = pendingMode ? "レベルを選んでください" : "遊びたいゲームを選んでください";
-    screen.appendChild(sub);
     if (!pendingMode) {
         const list = document.createElement("div");
         list.className = "menu-list";
@@ -9033,12 +9035,6 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
     guaranteeBtn.disabled = !!opts.startBusy;
     guaranteeBtn.addEventListener("click", handlers.onToggleGuarantee);
     guaranteeWrap.appendChild(guaranteeBtn);
-    const guaranteeDesc = document.createElement("div");
-    guaranteeDesc.className = "guarantee-desc";
-    guaranteeDesc.textContent = opts.guaranteeEnabled
-        ? "実際にクリア済みのseedから開始します"
-        : "通常のランダムseedで開始します";
-    guaranteeWrap.appendChild(guaranteeDesc);
     screen.appendChild(guaranteeWrap);
     if (pendingMode === "freecell" || pendingMode === "klondike" || pendingMode === "spider") {
         const supportWrap = document.createElement("div");
@@ -9049,20 +9045,6 @@ function renderMenuScreen(root, pendingMode, opts, handlers) {
         supportBtn.disabled = !!opts.startBusy;
         supportBtn.addEventListener("click", handlers.onToggleSupport);
         supportWrap.appendChild(supportBtn);
-        const supportDesc = document.createElement("div");
-        supportDesc.className = "support-desc";
-        supportDesc.textContent = opts.supportEnabled
-            ? (pendingMode === "spider"
-                ? "事前解析済みSpider seedを使い、次の一手を常時案内します"
-                : pendingMode === "klondike"
-                    ? "事前解析済みseedを優先し、次の一手を常時案内します"
-                    : "解析済みseedを優先し、次の一手を常時案内します")
-            : (pendingMode === "spider"
-                ? "ONにするとクリア保証もONになり、事前生成済みSpider seedを使います"
-                : pendingMode === "klondike"
-                    ? "ONにするとクリア保証もONになり、解析済みクロンダイクseedを使います"
-                    : "ONにするとクリア保証もONになり、解析済みFreeCell seedを優先します");
-        supportWrap.appendChild(supportDesc);
         screen.appendChild(supportWrap);
     }
     const backBtn = document.createElement("button");
